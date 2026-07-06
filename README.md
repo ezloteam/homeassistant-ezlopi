@@ -1,5 +1,8 @@
 # ezloPi for Home Assistant
 
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=ezloteam&repository=homeassistant-ezlopi&category=integration)
+[![Open your Home Assistant instance and start setting up a new integration.](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=ezlopi)
+
 A custom [Home Assistant](https://www.home-assistant.io/) integration for
 [ezloPi](https://ezlopi.com/) controllers. It logs in to your Ezlo cloud
 account, discovers your controllers, and then talks to each one **locally** over
