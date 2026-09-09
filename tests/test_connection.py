@@ -238,6 +238,135 @@ async def test_misc_accessors_and_start(hass: HomeAssistant) -> None:
     await c.async_stop()
 
 
+def _make_nma(
+    hass: HomeAssistant, ws: _WS, url: str | None = None
+) -> EzloHubConnection:
+    return EzloHubConnection(
+        hass, _Session(ws), _Browser(url), "105203280", "tok",
+        on_update=lambda: None,
+        jwt_token="jwt", legacy_auth="A", legacy_sig="S",
+        nma_url="wss://nma-ui-cloud.ezlo.com/nma",
+    )
+
+
+async def test_nma_login_and_session(hass: HomeAssistant) -> None:
+    # loginUserMios (ha_1) and register (ha_2) succeed, then item/device data.
+    ws = _WS([
+        _Msg(aiohttp.WSMsgType.TEXT, json.dumps({"id": "ha_1", "result": {}})),
+        _Msg(aiohttp.WSMsgType.TEXT, json.dumps({"id": "ha_2", "result": {}})),
+        _Msg(aiohttp.WSMsgType.TEXT,
+             json.dumps({"id": "ha_3", "result": {"items": ITEMS, "devices": DEVICES}})),
+        _Msg(aiohttp.WSMsgType.CLOSED),
+    ])
+    c = _make_nma(hass, ws)
+
+    async def _noop() -> None:
+        return
+
+    with patch.object(c, "_async_keepalive", _noop):
+        await c._async_connect_and_listen_nma("wss://nma-ui-cloud.ezlo.com/nma")
+
+    # Handshake framed with api:1.0 and the MMS credentials.
+    login = json.loads(ws.sent[0])
+    assert login["method"] == "loginUserMios"
+    assert login["api"] == "1.0"
+    assert login["params"] == {"MMSAuth": "A", "MMSAuthSig": "S"}
+    assert json.loads(ws.sent[1])["method"] == "register"
+    assert json.loads(ws.sent[1])["params"] == {"serial": "105203280"}
+    # Queries were sent NMA-framed and data was applied.
+    assert json.loads(ws.sent[2])["api"] == "1.0"
+    assert c.items == ITEMS
+    assert c.devices == DEVICES
+    assert c._ready.is_set()
+    # nma_mode is cleared once the session ends.
+    assert c._nma_mode is False
+
+
+async def test_nma_login_missing_tokens(hass: HomeAssistant) -> None:
+    c = _make_nma(hass, _WS([]))
+    c._legacy_auth = None
+    c._ws = _WS([])  # type: ignore[assignment]
+    c._nma_mode = True
+    assert await c._nma_login(c._ws) is False  # type: ignore[arg-type]
+
+
+async def test_nma_login_rpc_error(hass: HomeAssistant) -> None:
+    ws = _WS([
+        _Msg(aiohttp.WSMsgType.TEXT,
+             json.dumps({"id": "ha_1", "error": {"code": 401, "data": "denied"}})),
+    ])
+    c = _make_nma(hass, ws)
+    c._ws = ws  # type: ignore[assignment]
+    c._nma_mode = True
+    assert await c._nma_login(ws) is False  # type: ignore[arg-type]
+
+
+async def test_nma_broadcast_without_ui_id(hass: HomeAssistant) -> None:
+    # Over NMA the item-update broadcast may lack the "ui_broadcast" id; it must
+    # still be matched by msg_subclass.
+    c = _make_nma(hass, _WS([]))
+    c.items = [dict(i) for i in ITEMS]
+    c._handle({"msg_subclass": "hub.item.updated",
+               "result": {"_id": "i_light", "value": 42}})
+    assert next(i for i in c.items if i["_id"] == "i_light")["value"] == 42
+
+
+async def test_send_nma_framing(hass: HomeAssistant) -> None:
+    ws = _WS([])
+    c = _make_nma(hass, ws)
+    c._ws = ws  # type: ignore[assignment]
+    c._nma_mode = True
+    await c.async_set_item_value("i_light", 10)
+    wire = json.loads(ws.sent[0])
+    assert wire["api"] == "1.0"
+    assert wire["method"] == "hub.item.value.set"
+    assert wire["params"]["_id"] == "i_light"
+
+
+async def test_run_uses_nma_when_no_local_url(hass: HomeAssistant) -> None:
+    c = _make_nma(hass, _WS([]), url=None)  # never discovered on the LAN
+    used = {"nma": 0}
+
+    async def _fake_nma(nma_url: str) -> None:
+        used["nma"] += 1
+
+    async def _sleep(_seconds: float) -> None:
+        c._closed = True
+
+    with (
+        patch.object(c, "_async_connect_and_listen_nma", _fake_nma),
+        patch.object(conn_mod.asyncio, "sleep", _sleep),
+    ):
+        await c._async_run()
+    assert used["nma"] == 1
+
+
+async def test_run_falls_back_to_nma_after_local_failures(hass: HomeAssistant) -> None:
+    c = _make_nma(hass, _WS([]), url="ws://x:1")  # local resolves but fails
+    calls = {"local": 0, "nma": 0}
+
+    async def _local_boom(url: str) -> None:
+        calls["local"] += 1
+        raise RuntimeError("unreachable")
+
+    async def _fake_nma(nma_url: str) -> None:
+        calls["nma"] += 1
+        c._closed = True  # stop after first NMA attempt
+
+    async def _sleep(_seconds: float) -> None:
+        return
+
+    with (
+        patch.object(c, "_async_connect_and_listen", _local_boom),
+        patch.object(c, "_async_connect_and_listen_nma", _fake_nma),
+        patch.object(conn_mod.asyncio, "sleep", _sleep),
+    ):
+        await c._async_run()
+    # Local tried up to the threshold, then NMA was used.
+    assert calls["local"] == conn_mod._LOCAL_FALLBACK_THRESHOLD
+    assert calls["nma"] == 1
+
+
 async def test_async_stop(hass: HomeAssistant) -> None:
     ws = _WS([])
     c = _make(hass, ws)

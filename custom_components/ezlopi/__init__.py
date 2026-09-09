@@ -79,7 +79,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: EzloConfigEntry) -> bool
 
     for hub in api.get_hub_list().values():
         connection = EzloHubConnection(
-            hass, session, browser, hub.serial, hub.token, on_update=lambda: None
+            hass, session, browser, hub.serial, hub.token,
+            on_update=lambda: None,
+            jwt_token=api.token,
+            legacy_auth=api.legacy_auth,
+            legacy_sig=api.legacy_sig,
+            nma_url=hub.nma_url,
         )
         coordinator = EzloDataUpdateCoordinator(hass, entry, connection)
         connection.start()

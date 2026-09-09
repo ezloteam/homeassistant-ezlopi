@@ -8,7 +8,32 @@ from custom_components.ezlopi.ezlopi_utils import (
     EzloAuthError,
     EzloCloudAPI,
     EzloConnectionError,
+    compute_nma_url,
 )
+
+
+def test_compute_nma_url_cloud_host() -> None:
+    # The live "-cloud.ezlo.com" host maps to its "-ui-cloud" client variant.
+    assert compute_nma_url("nma-server8-cloud.ezlo.com:443", None) == (
+        "wss://nma-server8-ui-cloud.ezlo.com:443/nma"
+    )
+
+
+def test_compute_nma_url_oem_host() -> None:
+    # Hosts without "-cloud" get "-ui-cloud" inserted before ".ezlo.com".
+    assert compute_nma_url("nma-server21-ezlo-security.ezlo.com", None) == (
+        "wss://nma-server21-ezlo-security-ui-cloud.ezlo.com/nma"
+    )
+
+
+def test_compute_nma_url_prefers_explicit_controller_url() -> None:
+    assert compute_nma_url(
+        "nma-server8-cloud.ezlo.com", [{"url": "wss://relay.example.com"}]
+    ) == "wss://relay.example.com/nma"
+
+
+def test_compute_nma_url_none_without_host() -> None:
+    assert compute_nma_url(None, None) is None
 
 
 class _Resp:
@@ -52,16 +77,42 @@ def _api(*responses: _Resp) -> EzloCloudAPI:
 
 async def test_fetch_hub_list_success() -> None:
     api = _api(
-        _Resp(200, {"token": "jwt"}),
+        _Resp(200, {"token": "jwt", "legacy_token": {"auth": "A", "sig": "S"}}),
         _Resp(200, {"controllers": [
             {"serial": "111", "uuid": "u", "name": "Hub", "local_key": "lk"},
             {"serial": "", "uuid": "x", "name": "skip"},  # blank serial ignored
         ]}),
+        # v1 enrichment: controller has no nma_host in v4, so a v1 lookup runs.
+        _Resp(200, {"data": {"controllers": [
+            {"serial": "111", "nma_host": "nma-server21-ezlo-security.ezlo.com:443"},
+        ]}}),
     )
     assert await api.fetch_hub_list() is True
     hubs = api.get_hub_list()
     assert list(hubs) == ["111"]
     assert hubs["111"].token == "lk"
+    # legacy MMS pair captured for the NMA handshake
+    assert (api.legacy_auth, api.legacy_sig) == ("A", "S")
+    # v1 nma_host transformed to the -ui-cloud wss endpoint
+    assert hubs["111"].nma_url == (
+        "wss://nma-server21-ezlo-security-ui-cloud.ezlo.com:443/nma"
+    )
+
+
+async def test_fetch_hub_list_nma_host_from_v4() -> None:
+    """When v4 already includes nma_host, no v1 enrichment call is made."""
+    api = _api(
+        _Resp(200, {"token": "jwt"}),
+        _Resp(200, {"controllers": [
+            {"serial": "111", "name": "Hub", "local_key": "lk",
+             "nma_host": "nma-server9-ezlo.ezlo.com"},
+        ]}),
+        # no third response queued -> IndexError if enrichment wrongly runs
+    )
+    assert await api.fetch_hub_list() is True
+    assert api.get_hub_list()["111"].nma_url == (
+        "wss://nma-server9-ezlo-ui-cloud.ezlo.com/nma"
+    )
 
 
 async def test_login_invalid_credentials() -> None:

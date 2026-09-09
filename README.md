@@ -15,6 +15,12 @@ locks, thermostats) as Home Assistant entities with live, push-based updates.
   against the Ezlo cloud to enumerate the controllers on your account and fetch
   each one's local access key. All device state and control then flows over a
   direct LAN websocket to the controller — no cloud round-trip per command.
+- **Cloud (NMA) fallback.** When a controller can't be found or reached on the
+  LAN, the integration transparently falls back to Ezlo's cloud NMA relay
+  (`wss://…-ui-cloud.ezlo.com/nma`) so remote hubs stay controllable. It keeps
+  re-probing the LAN and switches back to local control the moment the hub
+  reappears on the network. The relay is used only as a fallback; if the
+  account exposes no NMA host the integration stays local-only.
 - **Push updates.** The integration keeps a persistent websocket open to each
   hub and updates entities the moment the hub broadcasts a change, rather than
   polling.

@@ -8,7 +8,10 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 
-TO_REDACT = {CONF_USERNAME, CONF_PASSWORD, "token", "local_key", "serial"}
+TO_REDACT = {
+    CONF_USERNAME, CONF_PASSWORD, "token", "local_key", "serial",
+    "auth", "sig", "MMSAuth", "MMSAuthSig", "legacy_token",
+}
 
 
 async def async_get_config_entry_diagnostics(

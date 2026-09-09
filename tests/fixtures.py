@@ -100,7 +100,15 @@ class FakeCloudAPI:
     """Stand-in for EzloCloudAPI returning one hub."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        self._hubs = {SERIAL: EzloPIHubInfo(SERIAL, "local-key", "Hub")}
+        self.token = "jwt"
+        self.legacy_auth = "A"
+        self.legacy_sig = "S"
+        self._hubs = {
+            SERIAL: EzloPIHubInfo(
+                SERIAL, "local-key", "Hub",
+                nma_url="wss://nma-ui-cloud.ezlo.com/nma",
+            )
+        }
 
     async def fetch_hub_list(self) -> bool:
         return True

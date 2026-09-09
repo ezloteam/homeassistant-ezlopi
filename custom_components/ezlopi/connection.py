@@ -30,6 +30,9 @@ _READY_TIMEOUT = 20
 _KEEPALIVE_INTERVAL = 15
 # Raise a repair issue once a hub has been unreachable for this many tries.
 _UNREACHABLE_THRESHOLD = 3
+# After this many consecutive local misses/failures, fall back to the cloud
+# NMA relay (if configured) instead of the LAN websocket.
+_LOCAL_FALLBACK_THRESHOLD = 3
 
 
 class EzloHubConnection:
@@ -43,6 +46,10 @@ class EzloHubConnection:
         serial: str,
         token: str | None,
         on_update: Callable[[], None],
+        jwt_token: str | None = None,
+        legacy_auth: str | None = None,
+        legacy_sig: str | None = None,
+        nma_url: str | None = None,
     ) -> None:
         self._hass = hass
         self._session = session
@@ -50,6 +57,17 @@ class EzloHubConnection:
         self._serial = serial
         self._token = token
         self._on_update = on_update
+        # Cloud/NMA fallback credentials. When the hub can't be reached on the
+        # LAN we relay through the NMA broker at ``_nma_url`` using the cloud
+        # JWT (bearer) plus the legacy MMS pair (loginUserMios handshake).
+        self._jwt_token = jwt_token
+        self._legacy_auth = legacy_auth
+        self._legacy_sig = legacy_sig
+        self._nma_url = nma_url
+        # True while the active socket is the NMA relay, which frames requests
+        # differently ({"api": "1.0", ...}) from the LAN protocol.
+        self._nma_mode = False
+        self._id_counter = 0
 
         # Latest hub state, consumed by the coordinator via the utils helpers
         # (get_items/get_devices read these attributes).
@@ -105,10 +123,26 @@ class EzloHubConnection:
     def _resolve_url(self) -> str | None:
         return self._browser.get_connection_link_from_serial(self._serial)
 
+    def _next_id(self) -> str:
+        self._id_counter += 1
+        return f"ha_{self._id_counter}"
+
     async def _send(self, payload: dict[str, Any]) -> None:
         if self._ws is None or self._ws.closed:
             raise RuntimeError(f"hub {self._serial} not connected")
-        await self._ws.send_str(json.dumps(payload))
+        if self._nma_mode:
+            # The NMA broker expects the hub method wrapped in its own envelope
+            # with a unique id; responses/broadcasts are matched by content in
+            # _handle, so the id only needs to be unique per request.
+            wire: dict[str, Any] = {
+                "api": "1.0",
+                "method": payload.get("method"),
+                "id": self._next_id(),
+                "params": payload.get("params", {}),
+            }
+        else:
+            wire = payload
+        await self._ws.send_str(json.dumps(wire))
 
     @property
     def _issue_id(self) -> str:
@@ -116,20 +150,40 @@ class EzloHubConnection:
 
     async def _async_run(self) -> None:
         failures = 0
+        local_misses = 0
         while not self._closed:
             url = self._resolve_url()
-            if url is None:
-                # Hub not yet discovered over mDNS; wait and retry.
-                failures += 1
-            else:
-                try:
-                    await self._async_connect_and_listen(url)
+            # Prefer the LAN socket; fall back to the cloud NMA relay only once
+            # the hub has been missing/unreachable locally for a few tries (or
+            # was never discovered on the LAN) and an NMA URL is available.
+            use_nma = self._nma_url is not None and (
+                url is None or local_misses >= _LOCAL_FALLBACK_THRESHOLD
+            )
+            try:
+                if use_nma:
+                    await self._async_connect_and_listen_nma(self._nma_url)  # type: ignore[arg-type]
+                    # Re-probe the LAN after each NMA session so we return to
+                    # local control as soon as the hub reappears on the network.
+                    local_misses = 0
                     failures = 0
-                except asyncio.CancelledError:
-                    raise
-                except Exception as err:  # noqa: BLE001 - keep the supervisor alive
-                    _LOGGER.debug("hub %s connection error: %s", self._serial, err)
+                elif url is not None:
+                    await self._async_connect_and_listen(url)
+                    local_misses = 0
+                    failures = 0
+                else:
+                    # Not discovered locally and no NMA fallback available.
+                    local_misses += 1
                     failures += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:  # noqa: BLE001 - keep the supervisor alive
+                _LOGGER.debug("hub %s connection error: %s", self._serial, err)
+                failures += 1
+                if use_nma:
+                    # NMA attempt failed; retry the LAN before NMA again.
+                    local_misses = 0
+                else:
+                    local_misses += 1
             self._connected = False
             self._on_update()  # surface unavailability to entities
             if failures == _UNREACHABLE_THRESHOLD:
@@ -146,41 +200,146 @@ class EzloHubConnection:
                 await asyncio.sleep(_RECONNECT_DELAY)
 
     async def _async_connect_and_listen(self, url: str) -> None:
+        """Connect over the LAN websocket, log in offline, then stream state."""
         _LOGGER.info("Connecting to hub %s at %s", self._serial, url)
         # No ws heartbeat: the hub does not answer ping frames, so aiohttp's
         # heartbeat would tear the socket down. We keep it alive with periodic
         # application-level queries instead (see _async_keepalive).
+        self._nma_mode = False
         async with self._session.ws_connect(url) as ws:
             self._ws = ws
             self._connected = True
+            if await self._local_login(ws):
+                await self._async_run_session(ws)
 
-            # Offline login first; the hub only answers item/device queries once
-            # the login has been processed, so we send those on confirmation.
-            login = get_login_params()
-            login["params"]["user"] = self._serial
-            login["params"]["token"] = self._token
-            await self._send(login)
+    async def _local_login(self, ws: aiohttp.ClientWebSocketResponse) -> bool:
+        """Send the offline UI login and wait for the hub to confirm it.
 
-            keepalive: asyncio.Task[None] | None = None
-            try:
-                queries_sent = False
-                async for msg in ws:
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        data = self._parse(msg.data)
-                        if data is None:
-                            continue
-                        if not queries_sent and data.get("method") == _LOGIN_METHOD:
-                            _LOGGER.info("Hub %s logged in", self._serial)
-                            await self._send_queries()
-                            queries_sent = True
-                            keepalive = asyncio.ensure_future(self._async_keepalive())
-                            continue
-                        self._handle(data)
-                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                        break
-            finally:
-                if keepalive is not None:
-                    keepalive.cancel()
+        The hub only answers item/device queries once the login has been
+        processed, so callers send those after this returns True.
+        """
+        login = get_login_params()
+        login["params"]["user"] = self._serial
+        login["params"]["token"] = self._token
+        await self._send(login)
+        async for msg in ws:
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                data = self._parse(msg.data)
+                if data is not None and data.get("method") == _LOGIN_METHOD:
+                    _LOGGER.info("Hub %s logged in", self._serial)
+                    return True
+            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                return False
+        return False
+
+    async def _async_connect_and_listen_nma(self, nma_url: str) -> None:
+        """Connect through the cloud NMA relay when the LAN is unreachable.
+
+        The NMA host presents a certificate signed by a secp256k1 CA that the
+        stack can't validate (matching hubcmd's behaviour), so TLS verification
+        is disabled for this socket. Auth is the cloud JWT as a bearer header
+        plus the loginUserMios/register handshake.
+        """
+        _LOGGER.info("Connecting to hub %s via NMA relay %s", self._serial, nma_url)
+        self._nma_mode = True
+        headers = (
+            {"Authorization": f"Bearer {self._jwt_token}"} if self._jwt_token else {}
+        )
+        try:
+            async with self._session.ws_connect(
+                nma_url, ssl=False, headers=headers
+            ) as ws:
+                self._ws = ws
+                self._connected = True
+                try:
+                    logged_in = await asyncio.wait_for(
+                        self._nma_login(ws), timeout=_READY_TIMEOUT
+                    )
+                except (TimeoutError, asyncio.TimeoutError):
+                    _LOGGER.warning("Hub %s NMA login timed out", self._serial)
+                    return
+                if logged_in:
+                    await self._async_run_session(ws)
+        finally:
+            self._nma_mode = False
+
+    async def _nma_login(self, ws: aiohttp.ClientWebSocketResponse) -> bool:
+        """Perform the NMA handshake: loginUserMios then register by serial."""
+        if not self._legacy_auth or not self._legacy_sig:
+            _LOGGER.warning(
+                "Hub %s: no legacy MMS tokens available for NMA login",
+                self._serial,
+            )
+            return False
+        login_id = self._next_id()
+        await ws.send_str(json.dumps({
+            "api": "1.0",
+            "method": "loginUserMios",
+            "id": login_id,
+            "params": {
+                "MMSAuth": self._legacy_auth,
+                "MMSAuthSig": self._legacy_sig,
+            },
+        }))
+        resp = await self._await_response(ws, login_id)
+        if resp is None or self._rpc_error(resp):
+            _LOGGER.warning("Hub %s NMA loginUserMios failed: %s", self._serial, resp)
+            return False
+        register_id = self._next_id()
+        await ws.send_str(json.dumps({
+            "api": "1.0",
+            "method": "register",
+            "id": register_id,
+            "params": {"serial": self._serial},
+        }))
+        resp = await self._await_response(ws, register_id)
+        if resp is None or self._rpc_error(resp):
+            _LOGGER.warning("Hub %s NMA register failed: %s", self._serial, resp)
+            return False
+        _LOGGER.info("Hub %s registered over NMA", self._serial)
+        return True
+
+    async def _await_response(
+        self, ws: aiohttp.ClientWebSocketResponse, want_id: str
+    ) -> dict[str, Any] | None:
+        """Read frames until one matching ``want_id`` arrives (or the socket ends).
+
+        Broadcasts that arrive mid-handshake are ignored; the caller bounds this
+        with a timeout.
+        """
+        async for msg in ws:
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                data = self._parse(msg.data)
+                if data is not None and data.get("id") == want_id:
+                    return data
+            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                return None
+        return None
+
+    @staticmethod
+    def _rpc_error(data: dict[str, Any]) -> bool:
+        err = data.get("error")
+        return isinstance(err, dict) and bool(err.get("code"))
+
+    async def _async_run_session(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        """Send the initial queries, keep the socket alive, and stream updates.
+
+        Shared by the LAN and NMA transports once their respective logins have
+        completed; both speak the same hub RPC surface from here on.
+        """
+        await self._send_queries()
+        keepalive = asyncio.ensure_future(self._async_keepalive())
+        try:
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = self._parse(msg.data)
+                    if data is None:
+                        continue
+                    self._handle(data)
+                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    break
+        finally:
+            keepalive.cancel()
 
     async def _send_queries(self) -> None:
         for query in get_devices_info():
@@ -204,10 +363,12 @@ class EzloHubConnection:
         if data.get("method") == _LOGIN_METHOD:
             return
 
-        if data.get("id") == "ui_broadcast":
-            if data.get("msg_subclass") == "hub.item.updated":
-                result = data.get("result", {})
-                self._update_item(result.get("_id"), result.get("value"))
+        # Item-change broadcasts are keyed by msg_subclass. Locally they carry
+        # id "ui_broadcast"; relayed over NMA they may not, so match on the
+        # subclass directly rather than the id.
+        if data.get("msg_subclass") == "hub.item.updated":
+            result = data.get("result", {})
+            self._update_item(result.get("_id"), result.get("value"))
             return
 
         result = data.get("result") or {}
