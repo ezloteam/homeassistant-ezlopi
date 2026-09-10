@@ -123,12 +123,19 @@ class EzloLight(EzloEntity, LightEntity):
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         if ATTR_BRIGHTNESS in kwargs:
-            level = int(kwargs[ATTR_BRIGHTNESS] * 100 / 255)
-        else:
-            level = self._level or 100
-        await self._async_set_value(self._device_id, level)
+            # Setting the dimmer level (>=1) turns the load on by itself — the
+            # hub flips the on/off item automatically. We must NOT also send the
+            # on/off item: on this hardware an explicit "on" snaps the level back
+            # to 100%, overriding the requested brightness.
+            level = max(1, int(kwargs[ATTR_BRIGHTNESS] * 100 / 255))
+            await self._async_set_value(self._device_id, level)
+            return
+        # Plain on with no target brightness: use the on/off item when present
+        # (goes to full), otherwise drive the dimmer to its last level or full.
         if self._onoff_id is not None:
             await self._async_set_value(self._onoff_id, True)
+        else:
+            await self._async_set_value(self._device_id, self._level or 100)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         if self._onoff_id is not None:

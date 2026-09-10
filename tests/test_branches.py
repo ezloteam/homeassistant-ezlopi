@@ -98,8 +98,10 @@ async def test_dimmer_merges_switch_into_light(hass: HomeAssistant) -> None:
     await light.async_turn_off()
     assert ("sw", False) in coord.connection.sent
     await light.async_turn_on(brightness=255)
-    assert ("dm", 100) in coord.connection.sent  # brightness -> dimmer item
-    assert ("sw", True) in coord.connection.sent  # on -> switch item
+    assert ("dm", 100) in coord.connection.sent  # brightness -> dimmer item only
+    # The on/off item must NOT be sent for a brightness command: an explicit
+    # "on" snaps the hardware to 100%, overriding the requested brightness.
+    assert ("sw", True) not in coord.connection.sent
 
 
 async def test_standalone_switch_is_created(hass: HomeAssistant) -> None:
@@ -126,6 +128,43 @@ async def test_dimmer_onoff_value_types(
     light = EzloLight(coord, coord.data["dm"], {"id": "sw"})
     coord.data["sw"] = {"value": value}
     assert light.is_on is is_on
+
+
+async def test_dimmer_set_brightness_does_not_send_onoff(hass: HomeAssistant) -> None:
+    """Setting brightness must drive only the dimmer item.
+
+    On the hardware, an explicit on/off "on" snaps the level to 100%, so a
+    brightness command that also sent the on/off item would jump back to full.
+    """
+    from homeassistant.components.light import ATTR_BRIGHTNESS
+
+    coord = make_coordinator(hass, [make_item("dm", "d", "dimmer", 0, "int")],
+                             [make_device("d", "Dim", "")])
+    light = EzloLight(coord, coord.data["dm"], {"id": "sw"})
+    await light.async_turn_on(**{ATTR_BRIGHTNESS: 127})
+    # Exactly one command, to the dimmer item, at the mapped level (127->49).
+    assert coord.connection.sent == [("dm", 49)]
+    assert not any(item_id == "sw" for item_id, _ in coord.connection.sent)
+
+
+async def test_dimmer_brightness_clamped_to_minimum(hass: HomeAssistant) -> None:
+    """A tiny brightness maps to at least level 1 so it doesn't turn the load off."""
+    from homeassistant.components.light import ATTR_BRIGHTNESS
+
+    coord = make_coordinator(hass, [make_item("dm", "d", "dimmer", 0, "int")],
+                             [make_device("d", "Dim", "")])
+    light = EzloLight(coord, coord.data["dm"], {"id": "sw"})
+    await light.async_turn_on(**{ATTR_BRIGHTNESS: 1})  # 1 -> int(0.39) -> clamp to 1
+    assert coord.connection.sent == [("dm", 1)]
+
+
+async def test_dimmer_plain_on_uses_onoff(hass: HomeAssistant) -> None:
+    """Plain on (no brightness) uses the on/off item when present."""
+    coord = make_coordinator(hass, [make_item("dm", "d", "dimmer", 0, "int")],
+                             [make_device("d", "Dim", "")])
+    light = EzloLight(coord, coord.data["dm"], {"id": "sw"})
+    await light.async_turn_on()
+    assert coord.connection.sent == [("sw", True)]
 
 
 async def test_setup_lights_skips_items_without_device(hass: HomeAssistant) -> None:
