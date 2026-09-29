@@ -47,6 +47,8 @@ class FakeConnection:
         self.items = list(ITEMS)
         self.devices = list(DEVICES)
         self.firmware = "4.1.6"
+        self.chip = "esp32"
+        self.model = "ezlopi_frankever_us_wb01d-01b"
         self._on_update = kwargs.get("on_update", lambda: None)
         self.sent: list[tuple[str, Any]] = []
 
@@ -62,8 +64,8 @@ class FakeConnection:
     async def async_set_item_value(self, item_id: str, value: Any) -> None:
         self.sent.append((item_id, value))
 
-    async def async_start_firmware_update(self) -> None:
-        self.sent.append(("firmware_update", None))
+    async def async_start_firmware_update(self, version: str, url: str) -> None:
+        self.sent.append(("firmware_update", (version, url)))
 
 
 def make_coordinator(hass: Any, items: list[dict], devices: list[dict]) -> Any:

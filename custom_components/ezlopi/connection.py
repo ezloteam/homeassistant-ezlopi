@@ -74,8 +74,11 @@ class EzloHubConnection:
         self.items: list[dict[str, Any]] = []
         self.devices: list[dict[str, Any]] = []
         self.device_metadata: dict[str, Any] = {}
-        # Controller firmware version, from hub.info.get.
+        # Controller info from hub.info.get: firmware version, hardware chip
+        # (e.g. "esp32", "esp32c3") and model — used to pick the OTA image.
         self.firmware: str | None = None
+        self.chip: str | None = None
+        self.model: str | None = None
 
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._run_task: asyncio.Task[None] | None = None
@@ -120,18 +123,18 @@ class EzloHubConnection:
     async def async_set_item_value(self, item_id: str, value: Any) -> None:
         await self._send(set_item_value_request(item_id, value))
 
-    async def async_start_firmware_update(self) -> None:
-        """Ask the controller to start its OTA firmware update.
+    async def async_start_firmware_update(self, version: str, url: str) -> None:
+        """Start the controller's OTA to ``version`` from firmware image ``url``.
 
-        The hub pulls the firmware from its own configured source
-        (dl.mios.com), so no URL/binary is passed — it selects the correct
-        image for its hardware itself. Progress is reported by the hub via
-        ``hub.firmware.update.progress`` broadcasts.
+        Matches the Ezlo app's ``hub.firmware.update.start`` command (the newer
+        ezloPi OTA RPC). Note: 5.7.x firmware starts the OTA but does not ack the
+        command (EZPI-957), so a missing response does not mean it failed; the
+        installed version updates once the hub reboots onto the new image.
         """
         await self._send({
-            "method": "hub.firmware.update",
+            "method": "hub.firmware.update.start",
             "id": "_ID_",
-            "params": {},
+            "params": {"version": version, "urls": {"firmware": url}},
         })
 
     def _resolve_url(self) -> str | None:
@@ -389,6 +392,10 @@ class EzloHubConnection:
         changed = False
         if "firmware" in result:  # hub.info.get response
             self.firmware = result["firmware"]
+            # "hardware" is the chip family (esp32/esp32c3/...); both feed OTA
+            # image selection (see firmware.select_variant).
+            self.chip = result.get("hardware")
+            self.model = result.get("model")
             changed = True
         if "items" in result:
             self.items = result["items"]

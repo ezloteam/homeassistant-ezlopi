@@ -43,6 +43,12 @@
         },
         "firmware_update_failed": {
             "message": "Failed to start the firmware update for controller {serial}."
+        },
+        "firmware_manifest_unavailable": {
+            "message": "The firmware manifest is unavailable, so controller {serial} cannot be updated right now."
+        },
+        "firmware_variant_unknown": {
+            "message": "Could not determine the correct firmware image for controller {serial}."
         }
     },
     "issues": {

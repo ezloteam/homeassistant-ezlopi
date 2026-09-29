@@ -22,7 +22,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from . import EzloConfigEntry
 from .const import DOMAIN
 from .coordinator import EzloDataUpdateCoordinator
-from .firmware import EzloFirmwareCoordinator
+from .firmware import EzloFirmwareCoordinator, select_variant
 
 PARALLEL_UPDATES = 0
 
@@ -82,7 +82,8 @@ class EzloFirmwareUpdate(
     def latest_version(self) -> str | None:
         # Fall back to the installed version when the manifest is unavailable,
         # so HA doesn't render a spurious "unknown -> ..." update.
-        return self._firmware.data or self.installed_version
+        manifest = self._firmware.data
+        return manifest.version if manifest else self.installed_version
 
     @property
     def release_url(self) -> str:
@@ -102,8 +103,27 @@ class EzloFirmwareUpdate(
     async def async_install(
         self, version: str | None, backup: bool, **kwargs: Any
     ) -> None:
+        connection = self.coordinator.connection
+        manifest = self._firmware.data
+        if manifest is None:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="firmware_manifest_unavailable",
+                translation_placeholders={"serial": self._serial},
+            )
+        # Pick the exact image for this device (chip/version/model), matching
+        # the Ezlo app — refuse rather than flash a guessed/wrong binary.
+        variant = select_variant(
+            manifest, connection.chip, connection.firmware, connection.model
+        )
+        if variant is None:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="firmware_variant_unknown",
+                translation_placeholders={"serial": self._serial},
+            )
         try:
-            await self.coordinator.connection.async_start_firmware_update()
+            await connection.async_start_firmware_update(manifest.version, variant.url)
         except Exception as err:
             raise HomeAssistantError(
                 translation_domain=DOMAIN,
