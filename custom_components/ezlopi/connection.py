@@ -120,6 +120,20 @@ class EzloHubConnection:
     async def async_set_item_value(self, item_id: str, value: Any) -> None:
         await self._send(set_item_value_request(item_id, value))
 
+    async def async_start_firmware_update(self) -> None:
+        """Ask the controller to start its OTA firmware update.
+
+        The hub pulls the firmware from its own configured source
+        (dl.mios.com), so no URL/binary is passed — it selects the correct
+        image for its hardware itself. Progress is reported by the hub via
+        ``hub.firmware.update.progress`` broadcasts.
+        """
+        await self._send({
+            "method": "hub.firmware.update",
+            "id": "_ID_",
+            "params": {},
+        })
+
     def _resolve_url(self) -> str | None:
         return self._browser.get_connection_link_from_serial(self._serial)
 

@@ -62,6 +62,9 @@ class FakeConnection:
     async def async_set_item_value(self, item_id: str, value: Any) -> None:
         self.sent.append((item_id, value))
 
+    async def async_start_firmware_update(self) -> None:
+        self.sent.append(("firmware_update", None))
+
 
 def make_coordinator(hass: Any, items: list[dict], devices: list[dict]) -> Any:
     """Build a coordinator backed by a FakeConnection with the given data."""

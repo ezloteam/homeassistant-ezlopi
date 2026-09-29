@@ -14,3 +14,6 @@ EZLOPI_CONTROLLER_LIST_URL = "https://api-cloud.ezlo.com/api/v4/controller_list/
 EZLOPI_API = "EZLOPI_API"
 WS_API = "ws_api"
 LOCK = "lock"
+# Public ezloPi firmware release manifest — the same source the controllers use
+# for OTA. Its top-level `version` is the latest available firmware.
+EZLOPI_FIRMWARE_MANIFEST_URL = "https://dl.mios.com/ezloPI/manifest.json"

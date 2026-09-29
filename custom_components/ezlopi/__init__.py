@@ -17,6 +17,7 @@ from .connection import EzloHubConnection
 from .const import DOMAIN
 from .coordinator import EzloDataUpdateCoordinator
 from .ezlopi_utils import EzloAuthError, EzloCloudAPI
+from .firmware import EzloFirmwareCoordinator
 from .mdns_connector import EzloPiMDSConnector
 
 _LOGGER = logging.getLogger(__name__)
@@ -30,6 +31,7 @@ PLATFORMS: list[Platform] = [
     Platform.LOCK,
     Platform.SENSOR,
     Platform.SWITCH,
+    Platform.UPDATE,
 ]
 
 
@@ -38,6 +40,7 @@ class EzloRuntimeData:
     """Per-config-entry runtime state, stored on ConfigEntry.runtime_data."""
 
     api: EzloCloudAPI
+    firmware: EzloFirmwareCoordinator
     coordinators: list[EzloDataUpdateCoordinator] = field(default_factory=list)
 
 
@@ -74,7 +77,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: EzloConfigEntry) -> bool
     if not ok or not api.get_hub_list():
         raise ConfigEntryNotReady("No ezloPi hubs found for this account")
 
-    runtime = EzloRuntimeData(api=api)
+    # Account-wide firmware release tracker (latest version from dl.mios.com).
+    # Best-effort: a failed fetch leaves latest_version unknown, never blocks setup.
+    firmware = EzloFirmwareCoordinator(hass, session)
+    await firmware.async_refresh()
+
+    runtime = EzloRuntimeData(api=api, firmware=firmware)
     entry.runtime_data = runtime
 
     for hub in api.get_hub_list().values():
@@ -121,6 +129,8 @@ def _async_remove_stale_devices(
         if not coordinator.data:
             continue  # offline hub — leave its devices alone, they may return
         connected_serials.add(coordinator.serial)
+        # The controller's own device carries the firmware update entity.
+        valid.add(f"{coordinator.serial}_controller")
         for element in coordinator.data.values():
             device_id = element.get("deviceId") or element["id"]
             valid.add(f"{coordinator.serial}_{device_id}")
