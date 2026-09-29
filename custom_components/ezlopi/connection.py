@@ -68,6 +68,13 @@ class EzloHubConnection:
         # differently ({"api": "1.0", ...}) from the LAN protocol.
         self._nma_mode = False
         self._id_counter = 0
+        # Correlate request ids to awaiting futures for request/response calls
+        # (e.g. the OTA trigger), resolved from the read loop in _handle.
+        self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        # Set once a session receives real data (items/firmware). Used to detect
+        # a socket that connects/logs in but never delivers (e.g. 5.7.x firmware
+        # that rejects the local key) so we can fall back to NMA.
+        self._session_got_data = False
 
         # Latest hub state, consumed by the coordinator via the utils helpers
         # (get_items/get_devices read these attributes).
@@ -123,19 +130,59 @@ class EzloHubConnection:
     async def async_set_item_value(self, item_id: str, value: Any) -> None:
         await self._send(set_item_value_request(item_id, value))
 
+    async def _request(
+        self, method: str, params: dict[str, Any], timeout: float
+    ) -> dict[str, Any] | None:
+        """Send a method and wait for the hub's response (matched by id).
+
+        Returns the response dict, or None if the hub sent no response within
+        ``timeout`` (some commands, e.g. the OTA start, reboot before acking).
+        """
+        if self._ws is None or self._ws.closed:
+            raise RuntimeError(f"hub {self._serial} not connected")
+        req_id = self._next_id()
+        if self._nma_mode:
+            wire = {"api": "1.0", "method": method, "id": req_id, "params": params}
+        else:
+            wire = {"method": method, "id": req_id, "params": params}
+        fut: asyncio.Future[dict[str, Any]] = self._hass.loop.create_future()
+        self._pending[req_id] = fut
+        try:
+            await self._ws.send_str(json.dumps(wire))
+            return await asyncio.wait_for(fut, timeout)
+        except (TimeoutError, asyncio.TimeoutError):
+            return None
+        finally:
+            self._pending.pop(req_id, None)
+
     async def async_start_firmware_update(self, version: str, url: str) -> None:
         """Start the controller's OTA to ``version`` from firmware image ``url``.
 
-        Matches the Ezlo app's ``hub.firmware.update.start`` command (the newer
-        ezloPi OTA RPC). Note: 5.7.x firmware starts the OTA but does not ack the
-        command (EZPI-957), so a missing response does not mean it failed; the
-        installed version updates once the hub reboots onto the new image.
+        Sends the Ezlo app's ``hub.firmware.update.start`` command and inspects
+        the reply. 5.7.x firmware starts the OTA but reboots without acking
+        (EZPI-957), so *no* reply is treated as "started". An explicit error
+        reply (e.g. rpc.method.notfound on firmware too old for the OTA RPC, or
+        hub.firmware.update.busy/failed) is raised so the UI can surface it.
         """
-        await self._send({
-            "method": "hub.firmware.update.start",
-            "id": "_ID_",
-            "params": {"version": version, "urls": {"firmware": url}},
-        })
+        _LOGGER.info(
+            "hub %s: starting OTA to %s from %s", self._serial, version, url
+        )
+        resp = await self._request(
+            "hub.firmware.update.start",
+            {"version": version, "urls": {"firmware": url}},
+            timeout=15.0,
+        )
+        if resp is None:
+            _LOGGER.info(
+                "hub %s: OTA command sent, no ack (device rebooting to flash)",
+                self._serial,
+            )
+            return
+        if self._rpc_error(resp):
+            err = resp.get("error") or {}
+            _LOGGER.warning("hub %s: OTA rejected: %s", self._serial, err)
+            raise RuntimeError(str(err.get("data") or err.get("message") or err))
+        _LOGGER.info("hub %s: OTA start accepted", self._serial)
 
     def _resolve_url(self) -> str | None:
         return self._browser.get_connection_link_from_serial(self._serial)
@@ -226,14 +273,26 @@ class EzloHubConnection:
         async with self._session.ws_connect(url) as ws:
             self._ws = ws
             self._connected = True
-            if await self._local_login(ws):
-                await self._async_run_session(ws)
+            try:
+                logged_in = await asyncio.wait_for(
+                    self._local_login(ws), timeout=_READY_TIMEOUT
+                )
+            except (TimeoutError, asyncio.TimeoutError):
+                logged_in = False
+            if not logged_in:
+                # Login failed/timed out (e.g. 5.7.x firmware rejects the local
+                # offline-login key with "Bad password"). Raise so the supervisor
+                # counts a local miss and falls back to the NMA relay, which
+                # authenticates via the cloud and still works for these hubs.
+                raise RuntimeError(f"hub {self._serial} local login failed")
+            await self._async_run_session(ws)
 
     async def _local_login(self, ws: aiohttp.ClientWebSocketResponse) -> bool:
         """Send the offline UI login and wait for the hub to confirm it.
 
-        The hub only answers item/device queries once the login has been
-        processed, so callers send those after this returns True.
+        Returns True once the hub echoes the login method, False if the hub
+        rejects it (an error reply, e.g. ``user.login.badpassword`` on firmware
+        that no longer accepts the local key) or the socket closes.
         """
         login = get_login_params()
         login["params"]["user"] = self._serial
@@ -242,9 +301,18 @@ class EzloHubConnection:
         async for msg in ws:
             if msg.type == aiohttp.WSMsgType.TEXT:
                 data = self._parse(msg.data)
-                if data is not None and data.get("method") == _LOGIN_METHOD:
+                if data is None:
+                    continue
+                if data.get("method") == _LOGIN_METHOD:
                     _LOGGER.info("Hub %s logged in", self._serial)
                     return True
+                err = data.get("error")
+                if isinstance(err, dict) and err.get("code"):
+                    _LOGGER.warning(
+                        "Hub %s local login rejected: %s",
+                        self._serial, err.get("data") or err.get("message"),
+                    )
+                    return False
             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                 return False
         return False
@@ -343,9 +411,16 @@ class EzloHubConnection:
 
         Shared by the LAN and NMA transports once their respective logins have
         completed; both speak the same hub RPC surface from here on.
+
+        Raises if the socket connects but never delivers data within the ready
+        window (a "logged in" reply can be a lie — e.g. 5.7.x firmware rejects
+        the local key yet still echoes the login method), so the supervisor
+        falls back to the NMA relay instead of sitting on a dead link.
         """
+        self._session_got_data = False
         await self._send_queries()
         keepalive = asyncio.ensure_future(self._async_keepalive())
+        watchdog = asyncio.ensure_future(self._async_data_watchdog(ws))
         try:
             async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
@@ -357,6 +432,18 @@ class EzloHubConnection:
                     break
         finally:
             keepalive.cancel()
+            watchdog.cancel()
+        if not self._session_got_data:
+            raise RuntimeError(f"hub {self._serial} delivered no data after login")
+
+    async def _async_data_watchdog(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        """Drop the socket if no data arrives within the ready window."""
+        await asyncio.sleep(_READY_TIMEOUT)
+        if not self._session_got_data:
+            _LOGGER.warning(
+                "Hub %s connected but sent no data; dropping to fall back", self._serial
+            )
+            await ws.close()
 
     async def _send_queries(self) -> None:
         for query in get_devices_info():
@@ -377,6 +464,14 @@ class EzloHubConnection:
         return data if isinstance(data, dict) else None
 
     def _handle(self, data: dict[str, Any]) -> None:
+        # Deliver responses to in-flight _request() calls (e.g. OTA start).
+        req_id = data.get("id")
+        if req_id is not None and req_id in self._pending:
+            fut = self._pending.get(req_id)
+            if fut is not None and not fut.done():
+                fut.set_result(data)
+            return
+
         if data.get("method") == _LOGIN_METHOD:
             return
 
@@ -415,6 +510,9 @@ class EzloHubConnection:
                 if d.get("_id")
             }
             changed = True
+        if changed:
+            # Real data arrived — this session is delivering.
+            self._session_got_data = True
         if changed and self.items:
             # Ready once we have both items and their device metadata.
             if self.devices:

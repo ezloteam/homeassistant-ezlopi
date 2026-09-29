@@ -6,6 +6,7 @@ shared firmware manifest coordinator. Installing triggers the hub's OTA.
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from homeassistant.components.update import (
@@ -13,7 +14,7 @@ from homeassistant.components.update import (
     UpdateEntity,
     UpdateEntityFeature,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -27,6 +28,10 @@ from .firmware import EzloFirmwareCoordinator, select_variant
 PARALLEL_UPDATES = 0
 
 _RELEASE_URL = "https://dl.mios.com/ezloPI/"
+# The device gives no OTA progress and reboots mid-flash. async_install blocks
+# until the hub reconnects on the new version (so HA shows "Installing…" the
+# whole time); give up after this long as a backstop.
+_INSTALL_TIMEOUT = 600
 
 
 async def async_setup_entry(
@@ -61,6 +66,9 @@ class EzloFirmwareUpdate(
         self._firmware = firmware
         self._serial = coordinator.serial
         self._attr_unique_id = f"{self._serial}_firmware"
+        # True while async_install is running; keeps the entity available (and
+        # "Installing…") across the mid-OTA reboot instead of going unavailable.
+        self._installing = False
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
@@ -71,8 +79,7 @@ class EzloFirmwareUpdate(
 
     @property
     def available(self) -> bool:
-        # Installed version and the install action both need the hub online.
-        return self.coordinator.connection.connected
+        return self._installing or self.coordinator.connection.connected
 
     @property
     def installed_version(self) -> str | None:
@@ -122,11 +129,44 @@ class EzloFirmwareUpdate(
                 translation_key="firmware_variant_unknown",
                 translation_placeholders={"serial": self._serial},
             )
+        target = manifest.version
+        # Stay available/"Installing…" for the whole flash+reboot: HA keeps the
+        # update entity in progress while this coroutine runs, so we don't return
+        # until the hub reconnects reporting the new version (or we time out).
+        self._installing = True
+        self.async_write_ha_state()
         try:
-            await connection.async_start_firmware_update(manifest.version, variant.url)
-        except Exception as err:
+            try:
+                await connection.async_start_firmware_update(target, variant.url)
+            except Exception as err:
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="firmware_update_failed",
+                    translation_placeholders={"serial": self._serial},
+                ) from err
+            await self._async_wait_for_version(connection, target)
+        finally:
+            self._installing = False
+
+    async def _async_wait_for_version(self, connection: Any, target: str) -> None:
+        """Block until the hub reports ``target`` firmware, or time out."""
+        done = asyncio.Event()
+
+        @callback
+        def _check() -> None:
+            if connection.firmware == target:
+                done.set()
+
+        unsub = self.coordinator.async_add_listener(_check)
+        try:
+            _check()  # maybe already there
+            async with asyncio.timeout(_INSTALL_TIMEOUT):
+                await done.wait()
+        except (TimeoutError, asyncio.TimeoutError) as err:
             raise HomeAssistantError(
                 translation_domain=DOMAIN,
-                translation_key="firmware_update_failed",
+                translation_key="firmware_update_timeout",
                 translation_placeholders={"serial": self._serial},
             ) from err
+        finally:
+            unsub()

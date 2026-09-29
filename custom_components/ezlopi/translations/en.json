@@ -49,6 +49,9 @@
         },
         "firmware_variant_unknown": {
             "message": "Could not determine the correct firmware image for controller {serial}."
+        },
+        "firmware_update_timeout": {
+            "message": "Firmware update for controller {serial} did not complete in time."
         }
     },
     "issues": {

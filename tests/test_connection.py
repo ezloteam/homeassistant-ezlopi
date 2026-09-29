@@ -367,6 +367,90 @@ async def test_run_falls_back_to_nma_after_local_failures(hass: HomeAssistant) -
     assert calls["nma"] == 1
 
 
+async def test_ota_request_success_via_handle(hass: HomeAssistant) -> None:
+    ws = _WS([])
+    c = _make(hass, ws)
+    c._ws = ws  # type: ignore[assignment]
+    task = asyncio.ensure_future(
+        c.async_start_firmware_update("5.7.15", "http://x/dimmer.bin")
+    )
+    await asyncio.sleep(0)  # let the request send
+    sent = json.loads(ws.sent[-1])
+    assert sent["method"] == "hub.firmware.update.start"
+    assert sent["params"] == {"version": "5.7.15", "urls": {"firmware": "http://x/dimmer.bin"}}
+    c._handle({"id": sent["id"], "result": {}})  # accepted
+    await task  # no error
+
+
+async def test_request_timeout_returns_none(hass: HomeAssistant) -> None:
+    ws = _WS([])
+    c = _make(hass, ws)
+    c._ws = ws  # type: ignore[assignment]
+    # No response fed -> times out -> None (the OTA "no ack" case).
+    assert await c._request("hub.firmware.update.start", {}, timeout=0.01) is None
+
+
+async def test_ota_no_ack_is_treated_as_started(hass: HomeAssistant) -> None:
+    c = _make(hass, _WS([]))
+
+    async def _none(*_a: Any, **_k: Any) -> None:
+        return None
+
+    c._request = _none  # type: ignore[assignment]
+    await c.async_start_firmware_update("5.7.15", "http://x")  # no raise
+
+
+async def test_ota_error_response_raises(hass: HomeAssistant) -> None:
+    c = _make(hass, _WS([]))
+
+    async def _err(*_a: Any, **_k: Any) -> dict[str, Any]:
+        return {"error": {"code": -32000, "data": "hub.firmware.update.busy"}}
+
+    c._request = _err  # type: ignore[assignment]
+    with pytest.raises(RuntimeError):
+        await c.async_start_firmware_update("5.7.15", "http://x")
+
+
+async def test_local_login_rejected_returns_false(hass: HomeAssistant) -> None:
+    # 5.7.x firmware rejects the local key with a "Bad password" error reply.
+    ws = _WS([_Msg(aiohttp.WSMsgType.TEXT, json.dumps(
+        {"error": {"code": -32500, "data": "user.login.badpassword"}, "id": "_ID_"}))])
+    c = _make(hass, ws)
+    c._ws = ws  # type: ignore[assignment]
+    assert await c._local_login(ws) is False
+
+
+async def test_connect_raises_when_local_login_rejected(hass: HomeAssistant) -> None:
+    # A rejected login must raise so the supervisor falls back to NMA.
+    ws = _WS([
+        _Msg(aiohttp.WSMsgType.TEXT, json.dumps(
+            {"error": {"code": -32500, "data": "user.login.badpassword"}})),
+        _Msg(aiohttp.WSMsgType.CLOSED),
+    ])
+    c = _make(hass, ws)
+    with pytest.raises(RuntimeError):
+        await c._async_connect_and_listen("ws://x:1")
+
+
+async def test_session_no_data_raises(hass: HomeAssistant) -> None:
+    # Hub "logs in" but only returns errors (no items/firmware) — the watchdog
+    # must drop the session and raise so the supervisor falls back to NMA.
+    ws = _WS([_Msg(aiohttp.WSMsgType.TEXT, json.dumps(
+        {"method": "hub.info.get", "error": {"code": -32600, "data": "rpc.params.notfound"}, "id": "_ID_"}))])
+    c = _make(hass, ws)
+    c._ws = ws  # type: ignore[assignment]
+
+    async def _noop() -> None:
+        return
+
+    with (
+        patch.object(conn_mod, "_READY_TIMEOUT", 0),
+        patch.object(c, "_async_keepalive", _noop),
+        pytest.raises(RuntimeError),
+    ):
+        await c._async_run_session(ws)
+
+
 async def test_async_stop(hass: HomeAssistant) -> None:
     ws = _WS([])
     c = _make(hass, ws)

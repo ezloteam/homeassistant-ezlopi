@@ -2,6 +2,7 @@
 from typing import Any
 
 import aiohttp
+from unittest.mock import patch
 import pytest
 from homeassistant.core import HomeAssistant
 
@@ -142,8 +143,16 @@ def _light_coord(hass: HomeAssistant) -> Any:
                             [make_device("d", "Dim", "")])
 
 
+def _entity(hass: HomeAssistant, data: FirmwareManifest | None, coord: Any = None) -> Any:
+    coord = coord or _light_coord(hass)
+    e = EzloFirmwareUpdate(coord, _FakeFirmware(data))  # type: ignore[arg-type]
+    e.hass = hass
+    e.async_write_ha_state = lambda: None  # type: ignore[method-assign]
+    return e
+
+
 async def test_update_entity_installed_and_latest(hass: HomeAssistant) -> None:
-    entity = EzloFirmwareUpdate(_light_coord(hass), _FakeFirmware(_MANIFEST))  # type: ignore[arg-type]
+    entity = _entity(hass, _MANIFEST)
     assert entity.installed_version == "4.1.6"
     assert entity.latest_version == "5.7.15"
     assert entity.available is True
@@ -152,26 +161,52 @@ async def test_update_entity_installed_and_latest(hass: HomeAssistant) -> None:
 
 
 async def test_update_entity_latest_falls_back_when_no_manifest(hass: HomeAssistant) -> None:
-    entity = EzloFirmwareUpdate(_light_coord(hass), _FakeFirmware(None))  # type: ignore[arg-type]
+    entity = _entity(hass, None)
     assert entity.latest_version == entity.installed_version == "4.1.6"
 
 
 async def test_update_entity_unavailable_when_disconnected(hass: HomeAssistant) -> None:
     coord = _light_coord(hass)
     coord.connection.connected = False
-    entity = EzloFirmwareUpdate(coord, _FakeFirmware(_MANIFEST))  # type: ignore[arg-type]
+    entity = _entity(hass, _MANIFEST, coord)
     assert entity.available is False
 
 
-async def test_update_entity_install_sends_correct_image(hass: HomeAssistant) -> None:
+async def test_install_sends_image_blocks_then_completes(hass: HomeAssistant) -> None:
+    import asyncio
     coord = _light_coord(hass)  # FakeConnection: chip esp32, 4.1.6, frankever dimmer
-    entity = EzloFirmwareUpdate(coord, _FakeFirmware(_MANIFEST))  # type: ignore[arg-type]
-    await entity.async_install(version=None, backup=False)
+    entity = _entity(hass, _MANIFEST, coord)
+    task = asyncio.ensure_future(entity.async_install(version=None, backup=False))
+    await asyncio.sleep(0)  # let it send the command and start waiting
+    # Correct image sent, and it is blocking (device not yet on target).
     assert ("firmware_update", ("5.7.15", "http://x/dimmer.bin")) in coord.connection.sent
+    assert not task.done()
+    assert entity._installing is True
+    # Available even while the hub is offline mid-flash (reboot).
+    coord.connection.connected = False
+    assert entity.available is True
+    # Device reboots onto the new version -> coordinator update releases install.
+    coord.connection.firmware = "5.7.15"
+    coord.async_update_listeners()
+    await task
+    assert entity._installing is False
+
+
+async def test_install_times_out_when_version_never_reached(hass: HomeAssistant) -> None:
+    from homeassistant.exceptions import HomeAssistantError
+
+    from custom_components.ezlopi import update as update_mod
+    coord = _light_coord(hass)
+    entity = _entity(hass, _MANIFEST, coord)
+    with patch.object(update_mod, "_INSTALL_TIMEOUT", 0.05):
+        with pytest.raises(HomeAssistantError):
+            await entity.async_install(version=None, backup=False)
+    assert entity._installing is False
 
 
 async def test_update_entity_install_without_manifest_raises(hass: HomeAssistant) -> None:
     from homeassistant.exceptions import HomeAssistantError
-    entity = EzloFirmwareUpdate(_light_coord(hass), _FakeFirmware(None))  # type: ignore[arg-type]
+    entity = _entity(hass, None)
     with pytest.raises(HomeAssistantError):
         await entity.async_install(version=None, backup=False)
+    assert entity._installing is False
