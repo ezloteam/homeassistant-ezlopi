@@ -90,6 +90,20 @@ def test_detect_tolerates_none_device_name() -> None:
 
 # ---- utils ----
 
+def test_get_items_data_skips_value_less_items() -> None:
+    # Control-only items (e.g. a dimmer's dimmer_up/down/stop) have show:true but
+    # no "value" key. They must be skipped, not crash the whole data build.
+    items = [
+        _item("dm", "d", "dimmer", 19, "int"),
+        {"_id": "up", "deviceId": "d", "name": "dimmer_up", "valueType": "int",
+         "hasSetter": True, "show": True},  # no "value" key
+        _item("sw", "d", "switch", False, "bool"),
+    ]
+    elements = getItemsData(FakeConnection(items, [_device("d", "Strip", "dimmer.outlet")]))
+    names = {e["name"] for e in elements}
+    assert names == {"dimmer", "switch"}  # dimmer_up skipped, no KeyError
+
+
 def test_get_items_data_and_helpers() -> None:
     conn = FakeConnection(ITEMS, DEVICES)
     elements = getItemsData(conn)

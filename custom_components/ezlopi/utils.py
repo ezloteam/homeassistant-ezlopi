@@ -100,6 +100,12 @@ def getItemsData(connector: Any, id: str = '') -> Any:
 
     for json_item in json_data:
         if json_item["show"] == True:
+            # Skip write-only / control items that carry no readable value
+            # (e.g. a dimmer's dimmer_up/dimmer_down/dimmer_stop triggers). They
+            # have no state to expose, and reading json_item["value"] on them
+            # would raise KeyError and break the whole hub's data processing.
+            if "value" not in json_item:
+                continue
             valueType = json_item["valueType"]
             scale = json_item["scale"] if("scale" in json_item) else None
             value = json_item["value"]
