@@ -24,6 +24,10 @@ _LOGGER = logging.getLogger(__name__)
 
 DATA_BROWSER = "browser"
 
+# Overall cap on waiting for hubs to deliver initial data during setup. Setup
+# never blocks longer than this regardless of how many hubs are slow/offline.
+_SETUP_READY_TIMEOUT = 12
+
 PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
     Platform.CLIMATE,
@@ -85,6 +89,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: EzloConfigEntry) -> bool
     runtime = EzloRuntimeData(api=api, firmware=firmware)
     entry.runtime_data = runtime
 
+    # Start every hub connection, then wait for initial data CONCURRENTLY with a
+    # short overall cap. Never block setup on a single hub: offline hubs, and
+    # 5.7.x hubs that need the (slower) NMA fallback, would otherwise serialize
+    # into a minutes-long setup that Home Assistant cancels ("stuck initializing").
+    # Entities for hubs that aren't ready yet are added later via the coordinator
+    # push, so a slow hub just appears a bit after startup.
     for hub in api.get_hub_list().values():
         connection = EzloHubConnection(
             hass, session, browser, hub.serial, hub.token,
@@ -96,17 +106,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: EzloConfigEntry) -> bool
         )
         coordinator = EzloDataUpdateCoordinator(hass, entry, connection)
         connection.start()
-        try:
-            await connection.async_wait_ready()
-        except (TimeoutError, asyncio.TimeoutError):
-            # Hub is on the account but not reachable on the LAN right now. Its
-            # connection keeps retrying in the background and its entities are
-            # added when it connects, so don't fail the whole entry for it.
-            _LOGGER.warning(
-                "ezloPi hub %s is not reachable on the local network yet", hub.serial
-            )
-        await coordinator.async_config_entry_first_refresh()
         runtime.coordinators.append(coordinator)
+
+    async def _wait_ready(coordinator: EzloDataUpdateCoordinator) -> None:
+        try:
+            await coordinator.connection.async_wait_ready()
+        except Exception:  # noqa: BLE001 - a hub not ready at startup is fine
+            _LOGGER.warning(
+                "ezloPi hub %s not ready at startup; it will appear once connected",
+                coordinator.serial,
+            )
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*(_wait_ready(c) for c in runtime.coordinators)),
+            timeout=_SETUP_READY_TIMEOUT,
+        )
+    except (TimeoutError, asyncio.TimeoutError):
+        _LOGGER.warning(
+            "ezloPi: not all hubs delivered data within %ss; continuing setup",
+            _SETUP_READY_TIMEOUT,
+        )
+
+    for coordinator in runtime.coordinators:
+        await coordinator.async_config_entry_first_refresh()
 
     # Devices are the physical end-devices (created from each entity's
     # device_info), not the controllers — so no hub device is registered here.
