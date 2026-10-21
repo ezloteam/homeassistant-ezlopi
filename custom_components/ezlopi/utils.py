@@ -154,6 +154,15 @@ def getItemsData(connector: Any, id: str = '') -> Any:
                 "unitOfMeasurement": None
             }
             
+            # Carry number/config metadata (ranges, mode, icon, category) so the
+            # number platform can build the entity without re-deriving it.
+            for meta_key in (
+                "entity_category", "native_min", "native_max", "native_step",
+                "mode", "icon",
+            ):
+                if meta_key in detection_result:
+                    element[meta_key] = detection_result[meta_key]
+
             # Add metadata to element
             if deviceId in device_metadata:
                 element["category"] = device_metadata[deviceId].get("category")

@@ -126,6 +126,27 @@ ITEM_NAME_PATTERNS: dict[str, dict[str, Any]] = {
     "current": {"platform": "sensor", "device_class": "current"},
 }
 
+# Exact item-name config items (device-0009 LED strip tunables). These are
+# NVS-persisted settings the firmware exposes as settable items; they must be
+# classified explicitly so they do not fall through to the value-type rules
+# (e.g. a small led_count would otherwise look like a 0-100 "light" brightness,
+# and boot_rgbcolor would be merged into the runtime light as its colour).
+CONFIG_ITEM_NAMES: dict[str, dict[str, Any]] = {
+    "led_count": {
+        "platform": "number", "device_class": None, "entity_category": "config",
+        "native_min": 1, "native_max": 1024, "native_step": 1, "mode": "box",
+        "icon": "mdi:led-strip-variant",
+    },
+    "boot_bri": {
+        "platform": "number", "device_class": None, "entity_category": "config",
+        "native_min": 0, "native_max": 255, "native_step": 1, "mode": "slider",
+        "icon": "mdi:brightness-6",
+    },
+    "boot_rgbcolor": {
+        "platform": "number_color", "device_class": None, "entity_category": "config",
+    },
+}
+
 # Category to platform mapping
 CATEGORY_MAP: dict[str, dict[str, Any]] = {
     "security": {
@@ -176,6 +197,14 @@ def detect_device_platform(device_info: dict[str, Any]) -> dict[str, Any]:
     Returns:
         Dictionary with platform and device_class keys
     """
+    # 0. Exact config item names (LED-strip tunables) win over everything, so
+    # they are never misread as a light/sensor by the generic rules below.
+    name_exact = device_info.get("name") or ""
+    if name_exact in CONFIG_ITEM_NAMES:
+        result = CONFIG_ITEM_NAMES[name_exact].copy()
+        _LOGGER.debug(f"Config item detected by name '{name_exact}': {result}")
+        return result
+
     # 1. Check explicit device type first
     device_type = device_info.get("deviceType") or device_info.get("device_type")
     if device_type and device_type in DEVICE_TYPE_MAP:
