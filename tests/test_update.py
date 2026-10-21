@@ -114,6 +114,39 @@ async def test_manifest_parses_full(hass: HomeAssistant) -> None:
     assert m.by_suffix("dimmer").url == "http://x/d.bin"  # type: ignore[union-attr]
 
 
+async def test_manifest_excludes_provisionless_default_build(hass: HomeAssistant) -> None:
+    """The thermostat/default esp32 build must be dropped from OTA candidates.
+
+    esp32_default is built from the bare committed sdkconfig (THERMOSTAT=y) and
+    ignores prov_data, so flashing it would turn a provisioned hub into a
+    thermostat and drop its devices. It must never be selectable.
+    """
+    payload = {"version": "5.7.19", "tag": "v5.7.19", "firmware": [
+        {"suffix": "esp32", "target": "esp32", "config": "sdkconfig.esp32",
+         "url": "http://x/esp32.bin", "md5": "m1"},
+        {"suffix": "esp32_default", "target": "esp32", "config": "sdkconfig",
+         "url": "http://x/default.bin", "md5": "m2"},
+    ]}
+    m = await _coord(hass, _Session(_Resp(200, payload)))._async_update_data()
+    assert m is not None
+    suffixes = {v.suffix for v in m.variants}
+    assert "esp32_default" not in suffixes
+    assert m.by_suffix("esp32_default") is None
+    # An esp32 hub still gets the safe generic image.
+    v = select_variant(m, "esp32", "5.7.19", "ezlopi_generic")
+    assert v is not None and v.suffix == "esp32" and v.config == "sdkconfig.esp32"
+
+
+def test_select_variant_refuses_default_even_if_present() -> None:
+    """Defense in depth: a default build is refused even if it reaches selection."""
+    manifest = FirmwareManifest(
+        version="5.7.19", tag="v5.7.19",
+        variants=(FirmwareVariant("esp32", "esp32", "d.bin", "http://x/d.bin",
+                                  "m", "sdkconfig"),),  # provisionless config
+    )
+    assert select_variant(manifest, "esp32", "5.7.19", "ezlopi_generic") is None
+
+
 async def test_manifest_http_error_keeps_last(hass: HomeAssistant) -> None:
     c = _coord(hass, _Session(_Resp(503)))
     c.data = _MANIFEST

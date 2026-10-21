@@ -38,6 +38,20 @@ class FirmwareVariant:
     filename: str
     url: str
     md5: str
+    config: str = ""
+
+
+def _is_provisionless_build(suffix: str, config: str) -> bool:
+    """True for a build that ignores prov_data (a committed-default config).
+
+    The manifest ships a dangerous ``esp32_default`` image built from the bare
+    committed ``sdkconfig`` (CONFIG_EZPI_TYPE_THERMOSTAT=y). Unlike the generic
+    per-target builds, it hardcodes a compiled-in thermostat config and IGNORES
+    the hub's prov_data, so OTA-flashing a provisioned hub to it turns the hub
+    into a thermostat and drops all its real devices. Such a build must never be
+    an OTA target, so it is dropped from the manifest before selection.
+    """
+    return suffix.lower().endswith("_default") or config.strip().lower() == "sdkconfig"
 
 
 @dataclass(frozen=True)
@@ -109,7 +123,13 @@ def select_variant(
             suffix = "esp32"
     else:
         suffix = "esp32"
-    return manifest.by_suffix(suffix)
+    variant = manifest.by_suffix(suffix)
+    # Defense in depth: never return a provisionless/default build even if one
+    # somehow matched (parsing already drops them). Flashing it would brick the
+    # hub's device set.
+    if variant is not None and _is_provisionless_build(variant.suffix, variant.config):
+        return None
+    return variant
 
 
 def _parse_manifest(payload: object) -> FirmwareManifest | None:
@@ -125,12 +145,21 @@ def _parse_manifest(payload: object) -> FirmwareManifest | None:
         suffix, target, url = entry.get("suffix"), entry.get("target"), entry.get("url")
         if not (suffix and target and url):
             continue
+        config = str(entry.get("config") or "")
+        if _is_provisionless_build(str(suffix), config):
+            # Drop the thermostat/default build so it can never be OTA-flashed.
+            _LOGGER.warning(
+                "ezloPi firmware: excluding provisionless build %r (config %r) "
+                "from OTA candidates", suffix, config,
+            )
+            continue
         variants.append(FirmwareVariant(
             suffix=str(suffix),
             target=str(target),
             filename=str(entry.get("filename") or ""),
             url=str(url),
             md5=str(entry.get("md5") or ""),
+            config=config,
         ))
     return FirmwareManifest(
         version=str(version),
