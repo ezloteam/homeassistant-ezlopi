@@ -167,6 +167,46 @@ async def test_dimmer_plain_on_uses_onoff(hass: HomeAssistant) -> None:
     assert coord.connection.sent == [("sw", True)]
 
 
+async def test_rgbw_light_color_and_set(hass: HomeAssistant) -> None:
+    from homeassistant.components.light import ATTR_BRIGHTNESS, ATTR_RGBW_COLOR, ColorMode
+
+    items = [
+        make_item("dm", "d", "dimmer", 50, "int"),
+        make_item("sw", "d", "switch", True, "bool"),
+        make_item("rgb", "d", "rgbcolor",
+                  {"red": 10, "green": 20, "blue": 30, "cwhite": 40}, "rgb"),
+    ]
+    coord = make_coordinator(hass, items, [make_device("d", "Strip", "")])
+    # The rgb item is classified as a colour facet, not its own entity.
+    assert coord.data["rgb"]["type"] == "light_color"
+
+    light = EzloLight(coord, coord.data["dm"], coord.data["sw"], coord.data["rgb"])
+    assert light.supported_color_modes == {ColorMode.RGBW}
+    assert light.color_mode == ColorMode.RGBW
+    assert light.rgbw_color == (10, 20, 30, 40)
+
+    # Setting colour writes the rgbcolor item (object, 0-255) and, since the
+    # strip is already on, does not touch the dimmer/switch.
+    await light.async_turn_on(**{ATTR_RGBW_COLOR: (1, 2, 3, 4)})
+    assert ("rgb", {"red": 1, "green": 2, "blue": 3, "cwhite": 4}) in coord.connection.sent
+    assert not any(item_id == "sw" for item_id, _ in coord.connection.sent)
+
+    # Colour + brightness in one call: colour item + dimmer level, no switch.
+    coord.connection.sent.clear()
+    await light.async_turn_on(**{ATTR_RGBW_COLOR: (5, 6, 7, 8), ATTR_BRIGHTNESS: 255})
+    assert ("rgb", {"red": 5, "green": 6, "blue": 7, "cwhite": 8}) in coord.connection.sent
+    assert ("dm", 100) in coord.connection.sent
+
+
+async def test_light_without_color_is_brightness_only(hass: HomeAssistant) -> None:
+    from homeassistant.components.light import ColorMode
+    coord = make_coordinator(hass, [make_item("dm", "d", "dimmer", 0, "int")],
+                             [make_device("d", "Dim", "")])
+    light = EzloLight(coord, coord.data["dm"], None)
+    assert light.supported_color_modes == {ColorMode.BRIGHTNESS}
+    assert light.rgbw_color is None
+
+
 async def test_setup_lights_skips_items_without_device(hass: HomeAssistant) -> None:
     from custom_components.ezlopi.light import _setup_lights
     coord = make_coordinator(hass, [], [])

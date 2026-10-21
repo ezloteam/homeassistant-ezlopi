@@ -3,7 +3,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from homeassistant.components.light import ATTR_BRIGHTNESS, ColorMode, LightEntity
+from homeassistant.components.light import (
+    ATTR_BRIGHTNESS,
+    ATTR_RGBW_COLOR,
+    ColorMode,
+    LightEntity,
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -40,6 +45,7 @@ def _setup_lights(
     def _add_new() -> None:
         levels: dict[str, dict[str, Any]] = {}
         onoff: dict[str, dict[str, Any]] = {}
+        colors: dict[str, dict[str, Any]] = {}
         for element in coordinator.data.values():
             device_id = element.get("deviceId")
             if device_id is None:
@@ -48,13 +54,17 @@ def _setup_lights(
                 levels.setdefault(device_id, element)
             elif element["type"] == "switch":
                 onoff.setdefault(device_id, element)
+            elif element["type"] == "light_color":
+                colors.setdefault(device_id, element)
 
         new = []
         for device_id, level in levels.items():
             if device_id in added:
                 continue
             added.add(device_id)
-            new.append(EzloLight(coordinator, level, onoff.get(device_id)))
+            new.append(EzloLight(
+                coordinator, level, onoff.get(device_id), colors.get(device_id)
+            ))
         if new:
             async_add_entities(new)
 
@@ -74,11 +84,33 @@ class EzloLight(EzloEntity, LightEntity):
         coordinator: EzloDataUpdateCoordinator,
         level_element: dict[str, Any],
         onoff_element: dict[str, Any] | None,
+        color_element: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(coordinator, level_element)  # _device_id = level item
         self._onoff_id = onoff_element["id"] if onoff_element else None
+        self._color_id = color_element["id"] if color_element else None
+        # With an rgbcolor item the light is a full RGBW color light (rgb + an
+        # independent white channel); otherwise it's brightness-only.
+        if self._color_id is not None:
+            self._attr_color_mode = ColorMode.RGBW
+            self._attr_supported_color_modes = {ColorMode.RGBW}
         # The entity is the device's light, so it takes the device name.
         self._attr_name = None
+
+    @property
+    def rgbw_color(self) -> tuple[int, int, int, int] | None:
+        """Current colour as (red, green, blue, white), each 0-255."""
+        if self._color_id is None:
+            return None
+        value = self.coordinator.data.get(self._color_id, {}).get("value")
+        if not isinstance(value, dict):
+            return None
+        return (
+            int(value.get("red", 0)),
+            int(value.get("green", 0)),
+            int(value.get("blue", 0)),
+            int(value.get("cwhite", 0)),
+        )
 
     @property
     def _level(self) -> int:
@@ -122,20 +154,30 @@ class EzloLight(EzloEntity, LightEntity):
         return int(self._level * 255 / 100)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
+        # Colour is independent of power — write it any time; it's visible once
+        # brightness > 0. (cwhite is a no-op on non-RGBW strips, real on RGBW.)
+        if self._color_id is not None and ATTR_RGBW_COLOR in kwargs:
+            red, green, blue, white = kwargs[ATTR_RGBW_COLOR]
+            await self._async_set_value(self._color_id, {
+                "red": int(red), "green": int(green),
+                "blue": int(blue), "cwhite": int(white),
+            })
+
         if ATTR_BRIGHTNESS in kwargs:
-            # Setting the dimmer level (>=1) turns the load on by itself — the
-            # hub flips the on/off item automatically. We must NOT also send the
-            # on/off item: on this hardware an explicit "on" snaps the level back
-            # to 100%, overriding the requested brightness.
+            # Setting the dimmer level (>=1) turns the load on by itself. We do
+            # NOT also send the on/off item: on the frankever dimmer an explicit
+            # "on" snaps to 100%, and on the LED strip "on" restores the previous
+            # level — either way it would override the requested brightness.
             level = max(1, int(kwargs[ATTR_BRIGHTNESS] * 100 / 255))
             await self._async_set_value(self._device_id, level)
-            return
-        # Plain on with no target brightness: use the on/off item when present
-        # (goes to full), otherwise drive the dimmer to its last level or full.
-        if self._onoff_id is not None:
-            await self._async_set_value(self._onoff_id, True)
-        else:
-            await self._async_set_value(self._device_id, self._level or 100)
+        elif not self.is_on:
+            # Turning on with no explicit brightness: use the on/off item when
+            # present (strip restores last level, frankever goes full), else
+            # drive the dimmer to its last level or full.
+            if self._onoff_id is not None:
+                await self._async_set_value(self._onoff_id, True)
+            else:
+                await self._async_set_value(self._device_id, self._level or 100)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         if self._onoff_id is not None:

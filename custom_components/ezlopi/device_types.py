@@ -251,7 +251,12 @@ def detect_by_value_type(device_info: dict[str, Any]) -> dict[str, Any]:
     
     elif value_type == "battery":
         return {"platform": "sensor", "device_class": "battery"}
-    
+
+    elif value_type == "rgb":
+        # RGB(W) color is a facet of the light, merged into the light entity
+        # (see light._setup_lights) — not its own standalone entity.
+        return {"platform": "light_color", "device_class": None}
+
     elif value_type in ["int", "float", "string", "token", "dictionary"]:
         # Check if it's a dimmer based on scale/range
         if has_setter and value_type in ["int", "float"]:
