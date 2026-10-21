@@ -304,6 +304,18 @@ class EzloHubConnection:
                 if data is None:
                     continue
                 if data.get("method") == _LOGIN_METHOD:
+                    # The login reply echoes the method whether it succeeded or
+                    # was rejected, so check for an error before trusting it.
+                    # Some firmware (5.7.15/5.7.16) appends a duplicate
+                    # "error":null that masks the real error object for last-wins
+                    # JSON parsing — '"error":{' only appears when an error
+                    # OBJECT is present, so it catches the masked case too.
+                    if self._rpc_error(data) or '"error":{' in msg.data:
+                        _LOGGER.warning(
+                            "Hub %s local login rejected (will fall back to NMA)",
+                            self._serial,
+                        )
+                        return False
                     _LOGGER.info("Hub %s logged in", self._serial)
                     return True
                 err = data.get("error")

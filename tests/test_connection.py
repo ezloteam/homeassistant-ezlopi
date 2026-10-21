@@ -451,6 +451,27 @@ async def test_session_no_data_raises(hass: HomeAssistant) -> None:
         await c._async_run_session(ws)
 
 
+async def test_local_login_rejected_despite_method_echo(hass: HomeAssistant) -> None:
+    # 5.7.15/5.7.16 dup-key bug: the reply echoes the login method AND carries
+    # an error object, but a trailing "error":null masks it for last-wins JSON.
+    # Must still be detected as a rejection (via the raw-string check).
+    raw = ('{"result":{},"error":{"code":-32500,"data":"user.login.badpassword"},'
+           '"error":null,"id":"_ID_","method":"hub.offline.login.ui"}')
+    ws = _WS([_Msg(aiohttp.WSMsgType.TEXT, raw)])
+    c = _make(hass, ws)
+    c._ws = ws  # type: ignore[assignment]
+    assert await c._local_login(ws) is False
+
+
+async def test_local_login_success_clean(hass: HomeAssistant) -> None:
+    # A clean success has only "error":null (no error object) -> logged in.
+    raw = '{"result":{},"error":null,"id":"_ID_","method":"hub.offline.login.ui"}'
+    ws = _WS([_Msg(aiohttp.WSMsgType.TEXT, raw)])
+    c = _make(hass, ws)
+    c._ws = ws  # type: ignore[assignment]
+    assert await c._local_login(ws) is True
+
+
 async def test_async_stop(hass: HomeAssistant) -> None:
     ws = _WS([])
     c = _make(hass, ws)
