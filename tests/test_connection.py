@@ -122,6 +122,39 @@ async def test_async_set_item_value_sends(hass: HomeAssistant) -> None:
     assert json.loads(ws.sent[0])["params"]["_id"] == "i_light"
 
 
+async def test_set_item_value_updates_locally_for_instant_feedback(
+    hass: HomeAssistant,
+) -> None:
+    """A successful set reflects the value in items immediately and notifies.
+
+    The hub applies the set but doesn't reliably broadcast it (and the keepalive
+    re-query is ~15s away), so without this local update Home Assistant keeps
+    showing the old value and the control snaps back as if nothing happened.
+    """
+    ws = _WS([])
+    c = _make(hass, ws)
+    c._ws = ws  # type: ignore[assignment]
+    c.items = [dict(i) for i in ITEMS]
+    updates: list[int] = []
+    c._on_update = lambda: updates.append(1)
+    await c.async_set_item_value("i_light", 10)
+    assert next(i for i in c.items if i["_id"] == "i_light")["value"] == 10
+    assert updates  # entities were notified to re-render at once
+
+
+async def test_set_item_value_not_reflected_when_send_fails(
+    hass: HomeAssistant,
+) -> None:
+    """If the send fails, the local value is NOT optimistically updated."""
+    ws = _WS([])
+    c = _make(hass, ws)  # no _ws set -> _send raises RuntimeError
+    c.items = [dict(i) for i in ITEMS]
+    before = next(i for i in c.items if i["_id"] == "i_light")["value"]
+    with pytest.raises(RuntimeError):
+        await c.async_set_item_value("i_light", 10)
+    assert next(i for i in c.items if i["_id"] == "i_light")["value"] == before
+
+
 async def test_send_without_connection_raises(hass: HomeAssistant) -> None:
     c = _make(hass, _WS([]))
     with pytest.raises(RuntimeError):

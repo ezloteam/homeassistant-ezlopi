@@ -96,12 +96,12 @@ async def test_dimmer_merges_switch_into_light(hass: HomeAssistant) -> None:
     assert light.is_on is True
     assert light.brightness == int(60 * 255 / 100)
     await light.async_turn_off()
-    assert ("sw", False) in coord.connection.sent
+    assert ("dm", 0) in coord.connection.sent  # off -> level 0
     await light.async_turn_on(brightness=255)
     assert ("dm", 100) in coord.connection.sent  # brightness -> dimmer item only
-    # The on/off item must NOT be sent for a brightness command: an explicit
-    # "on" snaps the hardware to 100%, overriding the requested brightness.
-    assert ("sw", True) not in coord.connection.sent
+    # The switch item is never sent: it is unreliable on some hubs (setting it
+    # true is a no-op), so on/off is driven entirely by the dimmer level.
+    assert not any(item_id == "sw" for item_id, _ in coord.connection.sent)
 
 
 async def test_standalone_switch_is_created(hass: HomeAssistant) -> None:
@@ -117,16 +117,23 @@ async def test_standalone_switch_is_created(hass: HomeAssistant) -> None:
 
 
 @pytest.mark.parametrize(
-    ("value", "is_on"),
-    [("on", True), ("off", False), (1, True), (0, False), (True, True)],
+    ("value", "vtype", "is_on"),
+    [(50, "int", True), (0, "int", False), ("on", "token", True),
+     ("off", "token", False), (True, "bool", True)],
 )
-async def test_dimmer_onoff_value_types(
-    hass: HomeAssistant, value: Any, is_on: bool
+async def test_is_on_comes_from_level_not_switch(
+    hass: HomeAssistant, value: Any, vtype: str, is_on: bool
 ) -> None:
-    coord = make_coordinator(hass, [make_item("dm", "d", "dimmer", 50, "int")],
+    """on/off is read from the dimmer level, never the switch item.
+
+    On the SK6812 strip the switch item stays false even when the strip is on,
+    so reading it made the light look permanently off. The level is truth.
+    """
+    coord = make_coordinator(hass, [make_item("dm", "d", "dimmer", value, vtype)],
                              [make_device("d", "Dim", "")])
-    light = EzloLight(coord, coord.data["dm"], {"id": "sw"})
-    coord.data["sw"] = {"value": value}
+    light = EzloLight(coord, coord.data["dm"])
+    # A stale/broken switch item is present but must be ignored.
+    coord.data["sw"] = {"value": False}
     assert light.is_on is is_on
 
 
@@ -140,7 +147,7 @@ async def test_dimmer_set_brightness_does_not_send_onoff(hass: HomeAssistant) ->
 
     coord = make_coordinator(hass, [make_item("dm", "d", "dimmer", 0, "int")],
                              [make_device("d", "Dim", "")])
-    light = EzloLight(coord, coord.data["dm"], {"id": "sw"})
+    light = EzloLight(coord, coord.data["dm"])
     await light.async_turn_on(**{ATTR_BRIGHTNESS: 127})
     # Exactly one command, to the dimmer item, at the mapped level (127->49).
     assert coord.connection.sent == [("dm", 49)]
@@ -153,18 +160,22 @@ async def test_dimmer_brightness_clamped_to_minimum(hass: HomeAssistant) -> None
 
     coord = make_coordinator(hass, [make_item("dm", "d", "dimmer", 0, "int")],
                              [make_device("d", "Dim", "")])
-    light = EzloLight(coord, coord.data["dm"], {"id": "sw"})
+    light = EzloLight(coord, coord.data["dm"])
     await light.async_turn_on(**{ATTR_BRIGHTNESS: 1})  # 1 -> int(0.39) -> clamp to 1
     assert coord.connection.sent == [("dm", 1)]
 
 
-async def test_dimmer_plain_on_uses_onoff(hass: HomeAssistant) -> None:
-    """Plain on (no brightness) uses the on/off item when present."""
+async def test_dimmer_plain_on_drives_level(hass: HomeAssistant) -> None:
+    """Plain on (no brightness) drives the level item, not the switch item.
+
+    Setting the switch item true is a no-op on some strips, so driving the
+    level (to its last value or full) is the only reliable way to turn on.
+    """
     coord = make_coordinator(hass, [make_item("dm", "d", "dimmer", 0, "int")],
                              [make_device("d", "Dim", "")])
-    light = EzloLight(coord, coord.data["dm"], {"id": "sw"})
+    light = EzloLight(coord, coord.data["dm"])
     await light.async_turn_on()
-    assert coord.connection.sent == [("sw", True)]
+    assert coord.connection.sent == [("dm", 100)]  # level 0 -> full
 
 
 async def test_rgbw_light_color_and_set(hass: HomeAssistant) -> None:
@@ -180,7 +191,7 @@ async def test_rgbw_light_color_and_set(hass: HomeAssistant) -> None:
     # The rgb item is classified as a colour facet, not its own entity.
     assert coord.data["rgb"]["type"] == "light_color"
 
-    light = EzloLight(coord, coord.data["dm"], coord.data["sw"], coord.data["rgb"])
+    light = EzloLight(coord, coord.data["dm"], coord.data["rgb"])
     assert light.supported_color_modes == {ColorMode.RGBW}
     assert light.color_mode == ColorMode.RGBW
     assert light.rgbw_color == (10, 20, 30, 40)

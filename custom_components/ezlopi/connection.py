@@ -133,6 +133,14 @@ class EzloHubConnection:
 
     async def async_set_item_value(self, item_id: str, value: Any) -> None:
         await self._send(set_item_value_request(item_id, value))
+        # Reflect the change locally at once. The hub applies the set but does
+        # not reliably broadcast the new value, and the keepalive re-query is up
+        # to ~15s away, so without this the item keeps its old value: Home
+        # Assistant's optimistic control snaps straight back and the command
+        # looks like it did nothing. This mirrors a hub.item.updated broadcast
+        # (same raw value shape), so a later real broadcast/keepalive reconciles
+        # it cleanly. A failed _send raises above and never reaches here.
+        self._update_item(item_id, value)
 
     async def _request(
         self, method: str, params: dict[str, Any], timeout: float
