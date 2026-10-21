@@ -87,20 +87,17 @@ class EzloEntity(CoordinatorEntity[EzloDataUpdateCoordinator]):
 
     @property
     def device_info(self) -> DeviceInfo:
-        """Link this entity to its physical ezlo device (e.g. "Frankever Dimmer").
-
-        The device is the end-device the item belongs to, not the controller —
-        there is no separate hub device. The controller serial is part of the
-        identifier so devices on different controllers don't collide.
+        """One HA device per ezloPi controller — every entity (lights, switches,
+        sensors and the firmware update) lives on it, keyed by the controller
+        serial, so an ezloPi shows up as a single device with all its entities.
         """
-        device_id = self._hub_device_id or self._device_id
-        name = self._ezlo_device_name or self._device_name
+        connection = self.coordinator.connection
         return DeviceInfo(
-            identifiers={(DOMAIN, f"{self._serial}_{device_id}")},
-            name=name,
+            identifiers={(DOMAIN, self._serial)},
+            name=connection.hub_name or f"ezloPi {self._serial}",
             manufacturer="ezloPi",
-            model="ezloPi ESP32",
-            sw_version=self.coordinator.connection.firmware,
+            model="ezloPi",
+            sw_version=connection.firmware,
         )
 
     async def _async_set_value(self, item_id: str, value: Any) -> None:

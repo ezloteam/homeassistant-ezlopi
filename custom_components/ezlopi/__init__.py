@@ -103,6 +103,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: EzloConfigEntry) -> bool
             legacy_auth=api.legacy_auth,
             legacy_sig=api.legacy_sig,
             nma_url=hub.nma_url,
+            name=hub.name,
         )
         coordinator = EzloDataUpdateCoordinator(hass, entry, connection)
         connection.start()
@@ -131,8 +132,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: EzloConfigEntry) -> bool
     for coordinator in runtime.coordinators:
         await coordinator.async_config_entry_first_refresh()
 
-    # Devices are the physical end-devices (created from each entity's
-    # device_info), not the controllers — so no hub device is registered here.
+    # One HA device per controller (keyed by serial) now carries every entity.
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     _async_remove_stale_devices(hass, entry, runtime)
     return True
@@ -141,36 +141,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: EzloConfigEntry) -> bool
 def _async_remove_stale_devices(
     hass: HomeAssistant, entry: EzloConfigEntry, runtime: EzloRuntimeData
 ) -> None:
-    """Drop registry devices that no longer correspond to a current ezlo device.
+    """Drop registry devices that aren't a current controller device.
 
-    Covers leftover hub/controller devices from older versions and physical
-    devices that have disappeared from a hub.
+    The integration now uses one device per controller (identifier = serial).
+    This removes leftovers from older versions: the per-end-device devices
+    (``serial_deviceId``) and the separate ``serial_controller`` firmware device,
+    which have no entities anymore now that everything lives on ``serial``.
     """
-    valid: set[str] = set()
-    connected_serials: set[str] = set()
-    for coordinator in runtime.coordinators:
-        if not coordinator.data:
-            continue  # offline hub — leave its devices alone, they may return
-        connected_serials.add(coordinator.serial)
-        # The controller's own device carries the firmware update entity.
-        valid.add(f"{coordinator.serial}_controller")
-        for element in coordinator.data.values():
-            device_id = element.get("deviceId") or element["id"]
-            valid.add(f"{coordinator.serial}_{device_id}")
+    valid = {coordinator.serial for coordinator in runtime.coordinators}
 
     device_registry = dr.async_get(hass)
     for device in dr.async_entries_for_config_entry(device_registry, entry.entry_id):
         idents = [i for (d, i) in device.identifiers if d == DOMAIN]
         if not idents or idents[0] in valid:
             continue
-        ident = idents[0]
-        # Remove legacy controller devices (bare serial, no "_") and physical
-        # devices a connected hub no longer reports.
-        is_legacy_hub = "_" not in ident
-        if is_legacy_hub or ident.split("_")[0] in connected_serials:
-            device_registry.async_update_device(
-                device.id, remove_config_entry_id=entry.entry_id
-            )
+        # Any ezlo device whose identifier isn't a known controller serial is a
+        # stale old-scheme device (per-end-device or _controller) — remove it.
+        device_registry.async_remove_device(device.id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: EzloConfigEntry) -> bool:

@@ -47,6 +47,7 @@ class FakeConnection:
         self.items = list(ITEMS)
         self.devices = list(DEVICES)
         self.firmware = "4.1.6"
+        self.hub_name = "Test ezloPi"
         self.chip = "esp32"
         self.model = "ezlopi_frankever_us_wb01d-01b"
         self._on_update = kwargs.get("on_update", lambda: None)

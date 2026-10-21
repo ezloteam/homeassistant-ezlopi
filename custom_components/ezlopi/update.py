@@ -98,12 +98,16 @@ class EzloFirmwareUpdate(
 
     @property
     def device_info(self) -> DeviceInfo:
-        """The controller itself — distinct from the physical end-devices."""
+        """The controller device — the SAME single device that carries this
+        controller's lights/switches/sensors, so firmware is just one more
+        entity on the ezloPi device rather than a separate controller device.
+        """
+        connection = self.coordinator.connection
         return DeviceInfo(
-            identifiers={(DOMAIN, f"{self._serial}_controller")},
-            name=f"ezloPi {self._serial}",
+            identifiers={(DOMAIN, self._serial)},
+            name=connection.hub_name or f"ezloPi {self._serial}",
             manufacturer="ezloPi",
-            model="ezloPi controller",
+            model="ezloPi",
             sw_version=self.installed_version,
         )
 

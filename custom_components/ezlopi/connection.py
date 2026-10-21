@@ -50,6 +50,7 @@ class EzloHubConnection:
         legacy_auth: str | None = None,
         legacy_sig: str | None = None,
         nma_url: str | None = None,
+        name: str | None = None,
     ) -> None:
         self._hass = hass
         self._session = session
@@ -57,6 +58,9 @@ class EzloHubConnection:
         self._serial = serial
         self._token = token
         self._on_update = on_update
+        # Controller's friendly name (from the cloud controller list); used as
+        # the HA device name so a controller is one device with all its entities.
+        self.hub_name = name
         # Cloud/NMA fallback credentials. When the hub can't be reached on the
         # LAN we relay through the NMA broker at ``_nma_url`` using the cloud
         # JWT (bearer) plus the legacy MMS pair (loginUserMios handshake).

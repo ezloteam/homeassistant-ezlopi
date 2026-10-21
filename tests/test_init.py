@@ -39,38 +39,54 @@ async def _setup(hass: HomeAssistant, entry: MockConfigEntry) -> None:
 
 
 async def test_setup_creates_entities_and_devices(hass: HomeAssistant) -> None:
+    from homeassistant.helpers import entity_registry as er
+
     entry = _entry()
     await _setup(hass, entry)
 
     assert entry.state is ConfigEntryState.LOADED
 
-    # the dimmer is one light, named after its device (has_entity_name)
-    light = hass.states.get("light.hall_dimmer")
-    assert light is not None
-    assert light.state == "on"
-
-    # Devices are the physical end-devices only — no separate hub/controller device.
+    # One HA device per controller (keyed by serial) carries every entity.
     dev_reg = dr.async_get(hass)
-    identifiers = {ident for d in dev_reg.devices.values() for ident in d.identifiers}
-    assert (DOMAIN, f"{SERIAL}_d_light") in identifiers
-    assert (DOMAIN, SERIAL) not in identifiers  # no hub device
+    ctrl = dev_reg.async_get_device_by_identifier((DOMAIN, SERIAL), entry.entry_id)
+    assert ctrl is not None
+    assert ctrl.sw_version == "4.1.6"  # from hub.info.get
+    # No per-end-device devices.
+    entry_devices = dr.async_entries_for_config_entry(dev_reg, entry.entry_id)
+    identifiers = {ident for d in entry_devices for ident in d.identifiers}
+    assert (DOMAIN, f"{SERIAL}_d_light") not in identifiers
 
-    # firmware from hub.info.get is shown as the device's sw_version
-    phys = dev_reg.async_get_device(identifiers={(DOMAIN, f"{SERIAL}_d_light")})
-    assert phys is not None
-    assert phys.sw_version == "4.1.6"
+    # The dimmer light exists, is on, and lives on the single controller device.
+    ent_reg = er.async_get(hass)
+    light_id = ent_reg.async_get_entity_id("light", DOMAIN, f"{SERIAL}_i_light")
+    assert light_id is not None
+    assert hass.states.get(light_id).state == "on"
+    assert ent_reg.async_get(light_id).device_id == ctrl.id
+    # The firmware update entity is on the SAME device.
+    fw_id = ent_reg.async_get_entity_id("update", DOMAIN, f"{SERIAL}_firmware")
+    assert fw_id is not None
+    assert ent_reg.async_get(fw_id).device_id == ctrl.id
 
 
 async def test_stale_devices_pruned(hass: HomeAssistant) -> None:
     entry = _entry()
     entry.add_to_hass(hass)
     dev_reg = dr.async_get(hass)
-    # Pre-seed a leftover hub/controller device from an older version.
+    # Pre-seed leftover old-scheme devices (per-end-device + _controller).
     dev_reg.async_get_or_create(
-        config_entry_id=entry.entry_id, identifiers={(DOMAIN, SERIAL)}, name="old hub"
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, f"{SERIAL}_d_old")}, name="old end-device",
+    )
+    dev_reg.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, f"{SERIAL}_controller")}, name="old controller",
     )
     await _setup(hass, entry)
-    assert dev_reg.async_get_device(identifiers={(DOMAIN, SERIAL)}) is None
+    # Old-scheme devices removed; the one controller device (serial) remains.
+    eid = entry.entry_id
+    assert dev_reg.async_get_device_by_identifier((DOMAIN, f"{SERIAL}_d_old"), eid) is None
+    assert dev_reg.async_get_device_by_identifier((DOMAIN, f"{SERIAL}_controller"), eid) is None
+    assert dev_reg.async_get_device_by_identifier((DOMAIN, SERIAL), eid) is not None
 
 
 async def test_unload(hass: HomeAssistant) -> None:

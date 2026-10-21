@@ -353,15 +353,16 @@ async def test_command_failure_raises_translated(hass: HomeAssistant) -> None:
         await EzloLight(coord, el, None).async_turn_off()
 
 
-async def test_device_info_falls_back_to_item(hass: HomeAssistant) -> None:
-    # An item with no parent device falls back to a device keyed by the item id.
+async def test_device_info_is_one_device_per_controller(hass: HomeAssistant) -> None:
+    # Every entity lives on a single device keyed by the controller serial,
+    # named after the controller (hub_name).
     item = {"_id": "i", "deviceId": None, "name": "dimmer", "value": 1,
             "valueType": "int", "hasSetter": True, "show": True}
     coord = make_coordinator(hass, [item], [])
     info = EzloLight(coord, coord.data["i"], None).device_info
     from custom_components.ezlopi.const import DOMAIN
-    assert info["identifiers"] == {(DOMAIN, f"{coord.serial}_i")}
-    assert info["name"] == "dimmer"
+    assert info["identifiers"] == {(DOMAIN, coord.serial)}
+    assert info["name"] == "Test ezloPi"
 
 
 # ---- device_types ----

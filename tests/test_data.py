@@ -29,6 +29,7 @@ class FakeConnection:
         self.serial = "105203280"
         self.connected = True
         self.firmware = "4.1.6"
+        self.hub_name = "Test ezloPi"
         self._on_update = lambda: None
         self.sent: list[tuple[str, Any]] = []
 
@@ -145,8 +146,8 @@ async def test_light_entity(hass: HomeAssistant) -> None:
     assert light.is_on is True
     assert light.brightness == int(50 * 255 / 100)
     assert light.available is True
-    # device_info groups items under the physical device.
-    assert (DOMAIN, "105203280_d_light") in light.device_info["identifiers"]
+    # device_info groups every entity under one device per controller.
+    assert (DOMAIN, "105203280") in light.device_info["identifiers"]
     await light.async_turn_off()
     assert coord.connection.sent[-1] == ("i_light", 0)
 

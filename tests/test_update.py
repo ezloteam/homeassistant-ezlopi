@@ -157,7 +157,8 @@ async def test_update_entity_installed_and_latest(hass: HomeAssistant) -> None:
     assert entity.latest_version == "5.7.15"
     assert entity.available is True
     assert entity.unique_id == f"{SERIAL}_firmware"
-    assert (DOMAIN, f"{SERIAL}_controller") in entity.device_info["identifiers"]
+    # Firmware lives on the single per-controller device (keyed by serial).
+    assert (DOMAIN, SERIAL) in entity.device_info["identifiers"]
 
 
 async def test_update_entity_latest_falls_back_when_no_manifest(hass: HomeAssistant) -> None:
