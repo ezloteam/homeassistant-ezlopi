@@ -149,8 +149,9 @@ async def test_dimmer_set_brightness_does_not_send_onoff(hass: HomeAssistant) ->
                              [make_device("d", "Dim", "")])
     light = EzloLight(coord, coord.data["dm"])
     await light.async_turn_on(**{ATTR_BRIGHTNESS: 127})
-    # Exactly one command, to the dimmer item, at the mapped level (127->49).
-    assert coord.connection.sent == [("dm", 49)]
+    # Exactly one command, to the dimmer item, at the mapped level
+    # (127/255*100 = 49.8 -> 50).
+    assert coord.connection.sent == [("dm", 50)]
     assert not any(item_id == "sw" for item_id, _ in coord.connection.sent)
 
 
@@ -161,7 +162,7 @@ async def test_dimmer_brightness_clamped_to_minimum(hass: HomeAssistant) -> None
     coord = make_coordinator(hass, [make_item("dm", "d", "dimmer", 0, "int")],
                              [make_device("d", "Dim", "")])
     light = EzloLight(coord, coord.data["dm"])
-    await light.async_turn_on(**{ATTR_BRIGHTNESS: 1})  # 1 -> int(0.39) -> clamp to 1
+    await light.async_turn_on(**{ATTR_BRIGHTNESS: 1})  # 1 -> round(0.39)=0 -> clamp to 1
     assert coord.connection.sent == [("dm", 1)]
 
 

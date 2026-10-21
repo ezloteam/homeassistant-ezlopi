@@ -10,6 +10,7 @@ from homeassistant.const import CONF_USERNAME, CONF_PASSWORD, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.typing import ConfigType
 
@@ -136,7 +137,40 @@ async def async_setup_entry(hass: HomeAssistant, entry: EzloConfigEntry) -> bool
     # One HA device per controller (keyed by serial) now carries every entity.
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     _async_remove_stale_devices(hass, entry, runtime)
+    _async_remove_migrated_boot_entities(hass, entry, runtime)
     return True
+
+
+def _async_remove_migrated_boot_entities(
+    hass: HomeAssistant, entry: EzloConfigEntry, runtime: EzloRuntimeData
+) -> None:
+    """Drop the pre-1.5.0 boot-indicator Number entities.
+
+    In 1.4.0 the LED-strip power-on indicator (``boot_bri`` + ``boot_rgbcolor``)
+    was exposed as Number entities: one ``boot_bri`` scalar and four
+    ``boot_rgbcolor`` colour channels. 1.5.0 models it as a config-category
+    light instead, so those numbers are orphaned on upgrade. Remove exactly the
+    migrated unique ids, scoped to the ``number`` domain — the new boot light
+    reuses the ``boot_bri`` item id, so it shares that unique id but lives in the
+    ``light`` domain and must be left untouched.
+    """
+    stale: set[str] = set()
+    for coordinator in runtime.coordinators:
+        serial = coordinator.serial
+        for element in coordinator.data.values():
+            item_id = element.get("id")
+            if element.get("type") == "config_light":
+                stale.add(f"{serial}_{item_id}")
+            elif element.get("type") == "config_light_color":
+                for channel in ("red", "green", "blue", "cwhite"):
+                    stale.add(f"{serial}_{item_id}_{channel}")
+    if not stale:
+        return
+
+    entity_registry = er.async_get(hass)
+    for entity in er.async_entries_for_config_entry(entity_registry, entry.entry_id):
+        if entity.domain == "number" and entity.unique_id in stale:
+            entity_registry.async_remove(entity.entity_id)
 
 
 def _async_remove_stale_devices(

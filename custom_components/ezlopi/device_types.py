@@ -129,8 +129,14 @@ ITEM_NAME_PATTERNS: dict[str, dict[str, Any]] = {
 # Exact item-name config items (device-0009 LED strip tunables). These are
 # NVS-persisted settings the firmware exposes as settable items; they must be
 # classified explicitly so they do not fall through to the value-type rules
-# (e.g. a small led_count would otherwise look like a 0-100 "light" brightness,
-# and boot_rgbcolor would be merged into the runtime light as its colour).
+# (e.g. a small led_count would otherwise look like a 0-100 "light" brightness).
+#
+# The power-on indicator (boot_bri + boot_rgbcolor) is modelled as a SEPARATE,
+# config-category light — "config_light" / "config_light_color" — so it is set
+# with Home Assistant's native colour wheel + brightness slider, exactly like
+# the runtime light, rather than as a row of raw channel sliders. They are kept
+# distinct from the runtime "light"/"light_color" types so the two never merge
+# into one entity (see light._setup_lights).
 CONFIG_ITEM_NAMES: dict[str, dict[str, Any]] = {
     "led_count": {
         "platform": "number", "device_class": None, "entity_category": "config",
@@ -138,12 +144,11 @@ CONFIG_ITEM_NAMES: dict[str, dict[str, Any]] = {
         "icon": "mdi:led-strip-variant",
     },
     "boot_bri": {
-        "platform": "number", "device_class": None, "entity_category": "config",
-        "native_min": 0, "native_max": 255, "native_step": 1, "mode": "slider",
-        "icon": "mdi:brightness-6",
+        "platform": "config_light", "device_class": None, "entity_category": "config",
     },
     "boot_rgbcolor": {
-        "platform": "number_color", "device_class": None, "entity_category": "config",
+        "platform": "config_light_color", "device_class": None,
+        "entity_category": "config",
     },
 }
 

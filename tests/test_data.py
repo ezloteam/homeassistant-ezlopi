@@ -144,7 +144,7 @@ async def test_light_entity(hass: HomeAssistant) -> None:
     coord = _coordinator(hass)
     light = EzloLight(coord, coord.data["i_light"], None)
     assert light.is_on is True
-    assert light.brightness == int(50 * 255 / 100)
+    assert light.brightness == round(50 * 255 / 100)
     assert light.available is True
     # device_info groups every entity under one device per controller.
     assert (DOMAIN, "105203280") in light.device_info["identifiers"]

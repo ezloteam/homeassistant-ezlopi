@@ -38,8 +38,9 @@ mapped to a Home Assistant entity by its type/category.
 
 | Home Assistant platform | ezloPi items |
 |---|---|
-| `light` | Dimmers (brightness 0–100 → 0–255) |
+| `light` | Dimmers (brightness 0–100 → 0–255) and RGBW colour strips (colour wheel + white channel). On an LED strip the power-on indicator is a second, config-category light named **Boot color** so its boot colour/brightness is set with the same native picker. |
 | `switch` | On/off switches and outlets |
+| `number` | LED-strip configuration (e.g. the **LED count**), shown under the device's configuration section |
 | `sensor` | Numeric/measurement items (temperature, humidity, battery, power, …) |
 | `binary_sensor` | Boolean items (motion, door/window, leak, tamper, …) |
 | `lock` | Locks (lock/unlock) |

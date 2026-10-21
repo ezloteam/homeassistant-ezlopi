@@ -9,6 +9,7 @@ from homeassistant.components.light import (
     ColorMode,
     LightEntity,
 )
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -38,12 +39,20 @@ async def async_setup_entry(
 def _setup_lights(
     coordinator: EzloDataUpdateCoordinator, async_add_entities: AddEntitiesCallback
 ) -> None:
-    added: set[str] = set()  # by hub device id
+    added: set[str] = set()  # by hub item id (unique per light)
 
     @callback
     def _add_new() -> None:
+        # Two kinds of light live on a strip device, kept apart so they never
+        # merge into one entity:
+        #   - the runtime light (dimmer level 0-100 + rgbcolor), and
+        #   - the boot colour (boot_bri 0-255 + boot_rgbcolor), a
+        #     config-category light so the power-on colour/brightness is set
+        #     with Home Assistant's native colour wheel instead of raw sliders.
         levels: dict[str, dict[str, Any]] = {}
         colors: dict[str, dict[str, Any]] = {}
+        config_levels: dict[str, dict[str, Any]] = {}
+        config_colors: dict[str, dict[str, Any]] = {}
         for element in coordinator.data.values():
             device_id = element.get("deviceId")
             if device_id is None:
@@ -52,13 +61,27 @@ def _setup_lights(
                 levels.setdefault(device_id, element)
             elif element["type"] == "light_color":
                 colors.setdefault(device_id, element)
+            elif element["type"] == "config_light":
+                config_levels.setdefault(device_id, element)
+            elif element["type"] == "config_light_color":
+                config_colors.setdefault(device_id, element)
 
         new = []
         for device_id, level in levels.items():
-            if device_id in added:
+            if level["id"] in added:
                 continue
-            added.add(device_id)
+            added.add(level["id"])
             new.append(EzloLight(coordinator, level, colors.get(device_id)))
+        for device_id, level in config_levels.items():
+            if level["id"] in added:
+                continue
+            added.add(level["id"])
+            new.append(EzloLight(
+                coordinator, level, config_colors.get(device_id),
+                scale=255, entity_category=EntityCategory.CONFIG,
+                name="Boot color", translation_key=None,
+                icon="mdi:lightbulb-on-outline",
+            ))
         if new:
             async_add_entities(new)
 
@@ -77,7 +100,6 @@ class EzloLight(EzloEntity, LightEntity):
     the reliable primitive across all ezloPi dimmers.
     """
 
-    _attr_translation_key = "dimmer"
     _attr_color_mode = ColorMode.BRIGHTNESS
     _attr_supported_color_modes = {ColorMode.BRIGHTNESS}
 
@@ -86,16 +108,30 @@ class EzloLight(EzloEntity, LightEntity):
         coordinator: EzloDataUpdateCoordinator,
         level_element: dict[str, Any],
         color_element: dict[str, Any] | None = None,
+        *,
+        scale: int = 100,
+        entity_category: EntityCategory | None = None,
+        name: str | None = None,
+        translation_key: str | None = "dimmer",
+        icon: str | None = None,
     ) -> None:
         super().__init__(coordinator, level_element)  # _device_id = level item
         self._color_id = color_element["id"] if color_element else None
+        # Full-brightness value on the ezloPi side: the runtime dimmer runs
+        # 0-100, the boot-brightness item 0-255. HA brightness is always 0-255.
+        self._scale = scale
         # With an rgbcolor item the light is a full RGBW color light (rgb + an
         # independent white channel); otherwise it's brightness-only.
         if self._color_id is not None:
             self._attr_color_mode = ColorMode.RGBW
             self._attr_supported_color_modes = {ColorMode.RGBW}
-        # The entity is the device's light, so it takes the device name.
-        self._attr_name = None
+        self._attr_entity_category = entity_category
+        self._attr_translation_key = translation_key
+        if icon is not None:
+            self._attr_icon = icon
+        # The runtime light is the device's primary light (name=None -> device
+        # name); the boot light carries an explicit sub-name.
+        self._attr_name = name
 
     @property
     def rgbw_color(self) -> tuple[int, int, int, int] | None:
@@ -114,7 +150,7 @@ class EzloLight(EzloEntity, LightEntity):
 
     @property
     def _level(self) -> int:
-        """Current brightness on the ezloPi 0-100 scale."""
+        """Current brightness on the ezloPi scale (0-100 dimmer, 0-255 boot)."""
         value = self._element.get("value")
         if isinstance(value, bool):
             return 100 if value else 0
@@ -140,14 +176,14 @@ class EzloLight(EzloEntity, LightEntity):
 
     @property
     def brightness(self) -> int:
-        # ezloPi 0-100 -> Home Assistant 0-255
-        return int(self._level * 255 / 100)
+        # ezloPi scale -> Home Assistant 0-255
+        return min(255, round(self._level * 255 / self._scale))
 
     def _on_value(self) -> Any:
         """Value to drive the level item on to, matching its value type."""
         if isinstance(self._element.get("value"), bool):
             return True
-        return self._level or 100
+        return self._level or self._scale
 
     def _off_value(self) -> Any:
         """Value to drive the level item off, matching its value type."""
@@ -166,8 +202,8 @@ class EzloLight(EzloEntity, LightEntity):
             })
 
         if ATTR_BRIGHTNESS in kwargs:
-            # Setting the dimmer level (>=1) turns the load on at that level.
-            level = max(1, int(kwargs[ATTR_BRIGHTNESS] * 100 / 255))
+            # Setting the level (>=1) turns the load on at that brightness.
+            level = max(1, round(kwargs[ATTR_BRIGHTNESS] * self._scale / 255))
             await self._async_set_value(self._device_id, level)
         elif not self.is_on:
             # Plain on (no brightness): drive the level to its last value or
