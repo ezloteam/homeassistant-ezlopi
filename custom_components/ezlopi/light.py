@@ -5,9 +5,11 @@ from typing import Any
 
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
+    ATTR_EFFECT,
     ATTR_RGBW_COLOR,
     ColorMode,
     LightEntity,
+    LightEntityFeature,
 )
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant, callback
@@ -18,6 +20,12 @@ from .coordinator import EzloDataUpdateCoordinator
 from .entity import EzloEntity
 
 PARALLEL_UPDATES = 0
+
+# The device-0009 on-device effect engine's effect names (firmware token-enum).
+# Rendered locally on the strip; Home Assistant only selects the effect name.
+EFFECT_LIST = [
+    "solid", "rainbow", "color_wipe", "breathe", "theater_chase", "gradient",
+]
 
 
 async def async_setup_entry(
@@ -51,6 +59,7 @@ def _setup_lights(
         #     with Home Assistant's native colour wheel instead of raw sliders.
         levels: dict[str, dict[str, Any]] = {}
         colors: dict[str, dict[str, Any]] = {}
+        effects: dict[str, dict[str, Any]] = {}
         config_levels: dict[str, dict[str, Any]] = {}
         config_colors: dict[str, dict[str, Any]] = {}
         for element in coordinator.data.values():
@@ -61,6 +70,8 @@ def _setup_lights(
                 levels.setdefault(device_id, element)
             elif element["type"] == "light_color":
                 colors.setdefault(device_id, element)
+            elif element["type"] == "light_effect":
+                effects.setdefault(device_id, element)
             elif element["type"] == "config_light":
                 config_levels.setdefault(device_id, element)
             elif element["type"] == "config_light_color":
@@ -71,7 +82,10 @@ def _setup_lights(
             if level["id"] in added:
                 continue
             added.add(level["id"])
-            new.append(EzloLight(coordinator, level, colors.get(device_id)))
+            new.append(EzloLight(
+                coordinator, level, colors.get(device_id),
+                effect_element=effects.get(device_id),
+            ))
         for device_id, level in config_levels.items():
             if level["id"] in added:
                 continue
@@ -109,6 +123,7 @@ class EzloLight(EzloEntity, LightEntity):
         level_element: dict[str, Any],
         color_element: dict[str, Any] | None = None,
         *,
+        effect_element: dict[str, Any] | None = None,
         scale: int = 100,
         entity_category: EntityCategory | None = None,
         name: str | None = None,
@@ -117,6 +132,7 @@ class EzloLight(EzloEntity, LightEntity):
     ) -> None:
         super().__init__(coordinator, level_element)  # _device_id = level item
         self._color_id = color_element["id"] if color_element else None
+        self._effect_id = effect_element["id"] if effect_element else None
         # Full-brightness value on the ezloPi side: the runtime dimmer runs
         # 0-100, the boot-brightness item 0-255. HA brightness is always 0-255.
         self._scale = scale
@@ -125,6 +141,11 @@ class EzloLight(EzloEntity, LightEntity):
         if self._color_id is not None:
             self._attr_color_mode = ColorMode.RGBW
             self._attr_supported_color_modes = {ColorMode.RGBW}
+        # With an effect item the strip renders animations on-device; expose the
+        # firmware's effect names via Home Assistant's native effect selector.
+        if self._effect_id is not None:
+            self._attr_supported_features = LightEntityFeature.EFFECT
+            self._attr_effect_list = EFFECT_LIST
         self._attr_entity_category = entity_category
         self._attr_translation_key = translation_key
         if icon is not None:
@@ -147,6 +168,19 @@ class EzloLight(EzloEntity, LightEntity):
             int(value.get("blue", 0)),
             int(value.get("cwhite", 0)),
         )
+
+    def _effect_value(self) -> dict[str, Any]:
+        """The current effect item object ({effect, speed, intensity})."""
+        if self._effect_id is None:
+            return {}
+        value = self.coordinator.data.get(self._effect_id, {}).get("value")
+        return value if isinstance(value, dict) else {}
+
+    @property
+    def effect(self) -> str | None:
+        """Currently selected on-device effect name."""
+        effect = self._effect_value().get("effect")
+        return effect if isinstance(effect, str) else None
 
     @property
     def _level(self) -> int:
@@ -200,6 +234,15 @@ class EzloLight(EzloEntity, LightEntity):
                 "red": int(red), "green": int(green),
                 "blue": int(blue), "cwhite": int(white),
             })
+
+        # Effect is independent of power/colour: select it on the effect item,
+        # preserving the current speed/intensity (one dictionary item).
+        if self._effect_id is not None and ATTR_EFFECT in kwargs:
+            effect = dict(self._effect_value())
+            effect["effect"] = kwargs[ATTR_EFFECT]
+            effect.setdefault("speed", 50)
+            effect.setdefault("intensity", 50)
+            await self._async_set_value(self._effect_id, effect)
 
         if ATTR_BRIGHTNESS in kwargs:
             # Setting the level (>=1) turns the load on at that brightness.

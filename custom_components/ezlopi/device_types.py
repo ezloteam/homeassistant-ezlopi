@@ -210,6 +210,14 @@ def detect_device_platform(device_info: dict[str, Any]) -> dict[str, Any]:
         _LOGGER.debug(f"Config item detected by name '{name_exact}': {result}")
         return result
 
+    # The LED-strip on-device effect engine: a single ``dictionary`` item
+    # ({effect, speed, intensity}). It is merged into the strip's light entity
+    # (native effect selector) + two number entities (speed/intensity); it must
+    # not fall through to the value-type rules, which would call a dictionary a
+    # sensor. See light._setup_lights and number._setup_numbers.
+    if name_exact == "effect" and device_info.get("valueType") == "dictionary":
+        return {"platform": "light_effect", "device_class": None}
+
     # 1. Check explicit device type first
     device_type = device_info.get("deviceType") or device_info.get("device_type")
     if device_type and device_type in DEVICE_TYPE_MAP:

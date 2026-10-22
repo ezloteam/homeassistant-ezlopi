@@ -6,18 +6,27 @@ native colour wheel + brightness slider rather than raw channel sliders.
 """
 from typing import Any
 
-from homeassistant.components.light import ATTR_RGBW_COLOR, ColorMode
+from homeassistant.components.light import (
+    ATTR_EFFECT,
+    ATTR_RGBW_COLOR,
+    ColorMode,
+    LightEntityFeature,
+)
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 
 from custom_components.ezlopi import (
     EzloRuntimeData,
-    _async_remove_migrated_boot_entities,
+    _async_remove_migrated_strip_entities,
 )
 from custom_components.ezlopi.const import DOMAIN
 from custom_components.ezlopi.device_types import detect_device_platform
-from custom_components.ezlopi.light import EzloLight, _setup_lights
-from custom_components.ezlopi.number import EzloNumber, _setup_numbers
+from custom_components.ezlopi.light import EFFECT_LIST, EzloLight, _setup_lights
+from custom_components.ezlopi.number import (
+    EzloEffectParamNumber,
+    EzloNumber,
+    _setup_numbers,
+)
 
 from .fixtures import SERIAL, make_coordinator, make_device, make_item
 
@@ -40,6 +49,11 @@ def test_config_items_classified() -> None:
     assert detect_device_platform(
         {"name": "boot_rgbcolor", "valueType": "rgb", "hasSetter": True, "value": {}}
     )["platform"] == "config_light_color"
+    # The on-device effect engine (a dictionary item) folds into the light.
+    assert detect_device_platform(
+        {"name": "effect", "valueType": "dictionary", "hasSetter": True,
+         "value": {"effect": "solid", "speed": 50, "intensity": 50}}
+    )["platform"] == "light_effect"
 
 
 def test_led_count_not_misread_as_light() -> None:
@@ -58,6 +72,8 @@ def _strip_coord(hass: HomeAssistant) -> Any:
         make_item("cnt", "d", "led_count", 30, "int"),           # config scalar
         make_item("bb", "d", "boot_bri", 48, "int"),             # boot brightness
         _rgb("bc", "d", "boot_rgbcolor", {"red": 0, "green": 255, "blue": 0, "cwhite": 0}),
+        make_item("ef", "d", "effect",                           # on-device effect
+                  {"effect": "rainbow", "speed": 30, "intensity": 70}, "dictionary"),
     ]
     return make_coordinator(hass, items, [make_device("d", "Strip", "")])
 
@@ -89,6 +105,14 @@ async def test_two_lights_runtime_and_boot(hass: HomeAssistant) -> None:
     assert boot.name == "Boot color"
     assert boot._scale == 255
     assert boot.supported_color_modes == {ColorMode.RGBW}
+    # The effect engine folds into the runtime light, not the boot light.
+    assert runtime._effect_id == "ef"
+    assert runtime.effect_list == EFFECT_LIST
+    assert runtime.effect == "rainbow"
+    assert runtime.supported_features & LightEntityFeature.EFFECT
+    assert boot._effect_id is None
+    assert boot.effect_list is None
+    assert not (boot.supported_features & LightEntityFeature.EFFECT)
 
 
 async def test_boot_light_reads_brightness_and_colour(hass: HomeAssistant) -> None:
@@ -119,14 +143,52 @@ async def test_boot_light_set_brightness_and_colour(hass: HomeAssistant) -> None
     assert coord.connection.sent[-1] == ("bb", 0)
 
 
-# ---- led_count number ----
+# ---- on-device effect engine ----
 
-async def test_number_platform_builds_only_led_count(hass: HomeAssistant) -> None:
+async def test_effect_select_is_read_modify_write(hass: HomeAssistant) -> None:
+    coord = _strip_coord(hass)
+    lights: list[Any] = []
+    _setup_lights(coord, lambda e: lights.extend(e))
+    runtime = next(light for light in lights if light._color_id == "rgb")
+    # Selecting an effect preserves the current speed/intensity (one dict item).
+    await runtime.async_turn_on(**{ATTR_EFFECT: "breathe"})
+    assert coord.connection.sent[-1] == (
+        "ef", {"effect": "breathe", "speed": 30, "intensity": 70}
+    )
+
+
+# ---- number platform (led_count config + effect speed/intensity) ----
+
+async def test_number_platform_builds_led_count_and_effect_params(
+    hass: HomeAssistant,
+) -> None:
     coord = _strip_coord(hass)
     created: list[Any] = []
     _setup_numbers(coord, lambda e: created.extend(e))
-    assert len(created) == 1
-    assert created[0].entity_category is EntityCategory.CONFIG
+    # led_count (config) + effect speed + effect intensity.
+    assert len(created) == 3
+    params = [e for e in created if isinstance(e, EzloEffectParamNumber)]
+    assert len(params) == 2
+    # Effect params are live controls, not configuration.
+    assert all(e.entity_category is None for e in params)
+    led = [e for e in created if not isinstance(e, EzloEffectParamNumber)]
+    assert led[0].entity_category is EntityCategory.CONFIG
+    assert len({e.unique_id for e in created}) == 3
+
+
+async def test_effect_param_read_and_write(hass: HomeAssistant) -> None:
+    coord = _strip_coord(hass)
+    speed = EzloEffectParamNumber(coord, coord.data["ef"], "speed", "mdi:speedometer")
+    intensity = EzloEffectParamNumber(
+        coord, coord.data["ef"], "intensity", "mdi:brightness-percent")
+    assert speed.native_value == 30.0
+    assert intensity.native_value == 70.0
+    assert speed.native_min_value == 0.0 and speed.native_max_value == 100.0
+    # Setting one param writes the WHOLE effect object (read-modify-write).
+    await speed.async_set_native_value(80)
+    assert coord.connection.sent[-1] == (
+        "ef", {"effect": "rainbow", "speed": 80, "intensity": 70}
+    )
 
 
 async def test_scalar_number_value_and_set(hass: HomeAssistant) -> None:
@@ -139,9 +201,9 @@ async def test_scalar_number_value_and_set(hass: HomeAssistant) -> None:
     assert coord.connection.sent[-1] == ("cnt", 60)
 
 
-# ---- 1.4.0 -> 1.5.0 migration: drop the old boot Number entities ----
+# ---- upgrade migration: drop entities that moved platform/domain ----
 
-async def test_migration_removes_old_boot_numbers(hass: HomeAssistant) -> None:
+async def test_migration_removes_orphaned_strip_entities(hass: HomeAssistant) -> None:
     from homeassistant.helpers import entity_registry as er
     from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -150,24 +212,32 @@ async def test_migration_removes_old_boot_numbers(hass: HomeAssistant) -> None:
     entry.add_to_hass(hass)
     reg = er.async_get(hass)
 
-    # Pre-1.5.0 Number entities that must be removed.
+    # Pre-1.6.0 entities that must be removed: the five boot Numbers (1.4.0) and
+    # the effect Sensor the dictionary item fell through to (1.5.0).
     gone = [reg.async_get_or_create(
         "number", DOMAIN, f"{SERIAL}_bb", config_entry=entry).entity_id]
     for ch in ("red", "green", "blue", "cwhite"):
         gone.append(reg.async_get_or_create(
             "number", DOMAIN, f"{SERIAL}_bc_{ch}", config_entry=entry).entity_id)
+    gone.append(reg.async_get_or_create(
+        "sensor", DOMAIN, f"{SERIAL}_ef", config_entry=entry).entity_id)
 
-    # The new boot light shares the boot_bri item id but is in the light domain
-    # — it must survive. An unrelated config Number (led_count) must too.
-    boot_light = reg.async_get_or_create(
-        "light", DOMAIN, f"{SERIAL}_bb", config_entry=entry).entity_id
-    led_count = reg.async_get_or_create(
-        "number", DOMAIN, f"{SERIAL}_cnt", config_entry=entry).entity_id
+    # Entities that reuse the same item ids in their new domains must survive:
+    # the boot light (boot_bri item, light domain) and the effect speed/intensity
+    # numbers (effect item, number domain), plus the unrelated led_count number.
+    survive = [
+        reg.async_get_or_create(
+            "light", DOMAIN, f"{SERIAL}_bb", config_entry=entry).entity_id,
+        reg.async_get_or_create(
+            "number", DOMAIN, f"{SERIAL}_ef_speed", config_entry=entry).entity_id,
+        reg.async_get_or_create(
+            "number", DOMAIN, f"{SERIAL}_cnt", config_entry=entry).entity_id,
+    ]
 
     runtime = EzloRuntimeData(api=None, firmware=None, coordinators=[coord])  # type: ignore[arg-type]
-    _async_remove_migrated_boot_entities(hass, entry, runtime)
+    _async_remove_migrated_strip_entities(hass, entry, runtime)
 
     for entity_id in gone:
         assert reg.async_get(entity_id) is None, f"{entity_id} should be removed"
-    assert reg.async_get(boot_light) is not None, "boot light must survive"
-    assert reg.async_get(led_count) is not None, "led_count must survive"
+    for entity_id in survive:
+        assert reg.async_get(entity_id) is not None, f"{entity_id} must survive"
