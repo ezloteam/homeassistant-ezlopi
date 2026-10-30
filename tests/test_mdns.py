@@ -50,6 +50,30 @@ def test_get_serial_missing_raises() -> None:
         EzloPiMDSConnector().get_serial({"properties": {}})
 
 
+def test_resolver_skips_serial_less_service() -> None:
+    # A hub mid-reboot can advertise an incomplete record (no Serial TXT). It
+    # must not abort resolution for every other hub (that would kill the
+    # connection supervisor, which calls this on its loop).
+    c = EzloPiMDSConnector()
+    c.service_dict = {
+        "bad._ezlo._tcp.local.": {"properties": {}, "address": ["10.0.0.9"], "port": 17001},
+        "good._ezlo._tcp.local.": {
+            "properties": {"Serial": "105203837"}, "address": ["10.0.8.60"], "port": 17001},
+    }
+    assert c.get_connection_link_from_serial("105203837") == "ws://10.0.8.60:17001"
+    assert c.get_connection_links() == {"105203837": "ws://10.0.8.60:17001"}
+
+
+def test_resolver_skips_addressless_service() -> None:
+    # A record with no resolved address yet must be skipped, not raise IndexError.
+    c = EzloPiMDSConnector()
+    c.service_dict = {
+        "noaddr": {"properties": {"Serial": "105203837"}, "address": [], "port": 17001},
+    }
+    assert c.get_connection_link_from_serial("105203837") is None
+    assert c.get_connection_links() == {}
+
+
 def test_add_service_handles_missing_info() -> None:
     class _NoInfo:
         def get_service_info(self, *a: Any) -> None:

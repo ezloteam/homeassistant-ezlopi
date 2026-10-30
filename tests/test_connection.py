@@ -95,6 +95,38 @@ async def test_connect_login_and_receive(hass: HomeAssistant) -> None:
     assert c._ready.is_set()
 
 
+def test_is_already_logged_in_variants() -> None:
+    f = EzloHubConnection._is_already_logged_in
+    assert f({"error": {"code": -32500, "data": "user.login.alreadylogged"}}, "") is True
+    # Masked case: parsed error null, but the raw frame shows alreadylogged.
+    assert f({"error": None},
+             '{"error":{"code":-32500,"data":"user.login.alreadylogged"},"error":null}') is True
+    # A genuine bad-password rejection shares the -32500 code but is NOT this.
+    assert f({"error": {"code": -32500, "data": "user.login.badpassword"}}, "") is False
+
+
+async def test_local_login_tolerates_already_logged_in(hass: HomeAssistant) -> None:
+    # Sticky offline-login flag after an ungraceful reboot -> alreadylogged. The
+    # hub accepts methods without a fresh login, so we must proceed, not fail.
+    ws = _WS([_Msg(aiohttp.WSMsgType.TEXT, json.dumps({
+        "method": "hub.offline.login.ui",
+        "error": {"code": -32500, "data": "user.login.alreadylogged"},
+    }))])
+    c = _make(hass, ws)
+    c._ws = ws  # type: ignore[assignment]
+    assert await c._local_login(ws) is True  # type: ignore[arg-type]
+
+
+async def test_local_login_rejects_bad_password(hass: HomeAssistant) -> None:
+    ws = _WS([_Msg(aiohttp.WSMsgType.TEXT, json.dumps({
+        "method": "hub.offline.login.ui",
+        "error": {"code": -32500, "data": "user.login.badpassword"},
+    }))])
+    c = _make(hass, ws)
+    c._ws = ws  # type: ignore[assignment]
+    assert await c._local_login(ws) is False  # type: ignore[arg-type]
+
+
 async def test_item_update_broadcast(hass: HomeAssistant) -> None:
     c = _make(hass, _WS([]))
     c.items = [dict(i) for i in ITEMS]
@@ -223,6 +255,71 @@ async def test_run_handles_connect_error(hass: HomeAssistant) -> None:
     ):
         await c._async_run()  # error is swallowed, loop exits cleanly
     assert c._closed is True
+
+
+async def test_run_survives_resolve_error(hass: HomeAssistant) -> None:
+    # A malformed mDNS record that makes URL resolution raise must NOT kill the
+    # supervisor task (previously _resolve_url() ran outside the try/except, so
+    # one bad record left the hub offline until a reload).
+    c = _make(hass, _WS([]))
+
+    def _boom() -> str:
+        raise KeyError("Serial")
+
+    async def _sleep(_seconds: float) -> None:
+        c._closed = True
+
+    with (
+        patch.object(c, "_resolve_url", _boom),
+        patch.object(conn_mod.asyncio, "sleep", _sleep),
+    ):
+        await c._async_run()  # exception swallowed, loop exits cleanly
+    assert c._closed is True
+    assert c.connected is False
+
+
+async def test_data_watchdog_drops_silent_socket(hass: HomeAssistant) -> None:
+    # After the readiness phase, a socket that goes silent (board rebooted / WiFi
+    # dropped / half-open) must be dropped so the supervisor reconnects, instead
+    # of the read loop blocking until the OS TCP timeout while HA shows stale
+    # values. _last_rx is ancient, so the liveness check fires.
+    ws = _WS([])
+    c = _make(hass, ws)
+    c._session_got_data = True
+    c._last_rx = 0.0
+    with (
+        patch.object(conn_mod, "_READY_TIMEOUT", 0),
+        patch.object(conn_mod, "_LIVENESS_CHECK_INTERVAL", 0),
+        patch.object(conn_mod, "_LIVENESS_TIMEOUT", 0),
+    ):
+        await c._async_data_watchdog(ws)  # type: ignore[arg-type]
+    assert ws.closed is True
+
+
+async def test_data_watchdog_keeps_live_socket(hass: HomeAssistant) -> None:
+    # A socket that keeps receiving frames (recent _last_rx) is NOT dropped.
+    ws = _WS([])
+    c = _make(hass, ws)
+    c._session_got_data = True
+    c._last_rx = hass.loop.time()
+
+    calls = {"n": 0}
+
+    async def _sleep(_seconds: float) -> None:
+        # n1 = readiness sleep, n2 = first liveness sleep (then the check runs
+        # with a recent _last_rx and must NOT close), n3 = cancel the loop.
+        calls["n"] += 1
+        if calls["n"] >= 3:
+            raise asyncio.CancelledError
+
+    with (
+        patch.object(conn_mod, "_READY_TIMEOUT", 0),
+        patch.object(conn_mod, "_LIVENESS_TIMEOUT", 45),
+        patch.object(conn_mod.asyncio, "sleep", _sleep),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await c._async_data_watchdog(ws)  # type: ignore[arg-type]
+    assert ws.closed is False
 
 
 async def test_handle_items_only_does_not_ready(hass: HomeAssistant) -> None:

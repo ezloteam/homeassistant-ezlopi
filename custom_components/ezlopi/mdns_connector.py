@@ -82,8 +82,15 @@ class EzloPiMDSConnector(ServiceListener):
             raise ValueError('Expected serial but got None')
 
         for key, value in self.service_dict.items():
-            if self.get_serial(value) == serial:
-                return f'ws://{value["address"][0]}:{value["port"]}'
+            # A hub mid-reboot can briefly advertise an incomplete record (no
+            # Serial TXT yet, or no resolved address). Skip such an entry rather
+            # than let it abort resolution for every hub — this method is called
+            # from the connection supervisor, and a raise here would kill it.
+            try:
+                if self.get_serial(value) == serial:
+                    return f'ws://{value["address"][0]}:{value["port"]}'
+            except (KeyError, IndexError):
+                continue
 
         _LOGGER.debug("Hub %s not found on the local network (mDNS)", serial)
         return None
@@ -91,6 +98,9 @@ class EzloPiMDSConnector(ServiceListener):
     def get_connection_links(self) -> dict[str, str]:
         connection_links: dict[str, str] = {}
         for key, value in self.service_dict.items():
-            serial = self.get_serial(value)
-            connection_links[serial] = f'ws://{value["address"][0]}:{value["port"]}'
+            try:
+                serial = self.get_serial(value)
+                connection_links[serial] = f'ws://{value["address"][0]}:{value["port"]}'
+            except (KeyError, IndexError):
+                continue
         return connection_links

@@ -28,6 +28,14 @@ _RECONNECT_DELAY = 5
 _READY_TIMEOUT = 20
 # The hub closes idle sockets; keep traffic flowing well under that window.
 _KEEPALIVE_INTERVAL = 15
+# The keepalive queries the hub every _KEEPALIVE_INTERVAL; if no frame arrives
+# for this long the board is gone (reboot / WiFi drop / half-open socket). We
+# rely on the query keepalive rather than an aiohttp ws heartbeat because older
+# firmware ignores ping frames (newer builds answer them) — so without this a
+# silent drop leaves the read loop blocked until the OS TCP timeout (minutes)
+# and HA shows a dead hub online with stale values. ~3 missed keepalives.
+_LIVENESS_TIMEOUT = 45
+_LIVENESS_CHECK_INTERVAL = 10
 # Raise a repair issue once a hub has been unreachable for this many tries.
 _UNREACHABLE_THRESHOLD = 3
 # After this many consecutive local misses/failures, fall back to the cloud
@@ -79,6 +87,9 @@ class EzloHubConnection:
         # a socket that connects/logs in but never delivers (e.g. 5.7.x firmware
         # that rejects the local key) so we can fall back to NMA.
         self._session_got_data = False
+        # Monotonic time of the last frame received on the active socket; the
+        # liveness watchdog drops the socket if it goes stale (see that method).
+        self._last_rx = 0.0
 
         # Latest hub state, consumed by the coordinator via the utils helpers
         # (get_items/get_devices read these attributes).
@@ -228,14 +239,20 @@ class EzloHubConnection:
         failures = 0
         local_misses = 0
         while not self._closed:
-            url = self._resolve_url()
-            # Prefer the LAN socket; fall back to the cloud NMA relay only once
-            # the hub has been missing/unreachable locally for a few tries (or
-            # was never discovered on the LAN) and an NMA URL is available.
-            use_nma = self._nma_url is not None and (
-                url is None or local_misses >= _LOCAL_FALLBACK_THRESHOLD
-            )
+            # Everything that can fail — including URL resolution — stays inside
+            # the try. _resolve_url() walks shared mDNS state that a rebooting
+            # hub can briefly corrupt; if that (or anything else) raised out
+            # here the supervisor task would die silently and the hub would stay
+            # offline until a reload. The except below keeps the loop alive.
+            use_nma = False
             try:
+                url = self._resolve_url()
+                # Prefer the LAN socket; fall back to the cloud NMA relay only
+                # once the hub has been missing/unreachable locally for a few
+                # tries (or was never discovered on the LAN) and NMA is available.
+                use_nma = self._nma_url is not None and (
+                    url is None or local_misses >= _LOCAL_FALLBACK_THRESHOLD
+                )
                 if use_nma:
                     await self._async_connect_and_listen_nma(self._nma_url)  # type: ignore[arg-type]
                     # Re-probe the LAN after each NMA session so we return to
@@ -278,9 +295,12 @@ class EzloHubConnection:
     async def _async_connect_and_listen(self, url: str) -> None:
         """Connect over the LAN websocket, log in offline, then stream state."""
         _LOGGER.info("Connecting to hub %s at %s", self._serial, url)
-        # No ws heartbeat: the hub does not answer ping frames, so aiohttp's
-        # heartbeat would tear the socket down. We keep it alive with periodic
-        # application-level queries instead (see _async_keepalive).
+        # No aiohttp ws heartbeat: older firmware (e.g. 837 on 5.7.19) predates
+        # WS ping/pong and ignores ping frames, so aiohttp's heartbeat would
+        # time out and tear the socket down. Newer builds do answer pings, but a
+        # periodic application-level query (see _async_keepalive) keeps the
+        # socket alive on BOTH, so we use that universally rather than special-
+        # casing per firmware version.
         self._nma_mode = False
         async with self._session.ws_connect(url) as ws:
             self._ws = ws
@@ -323,6 +343,11 @@ class EzloHubConnection:
                     # JSON parsing — '"error":{' only appears when an error
                     # OBJECT is present, so it catches the masked case too.
                     if self._rpc_error(data) or '"error":{' in msg.data:
+                        if self._is_already_logged_in(data, msg.data):
+                            _LOGGER.info(
+                                "Hub %s already logged in; proceeding", self._serial
+                            )
+                            return True
                         _LOGGER.warning(
                             "Hub %s local login rejected (will fall back to NMA)",
                             self._serial,
@@ -332,6 +357,11 @@ class EzloHubConnection:
                     return True
                 err = data.get("error")
                 if isinstance(err, dict) and err.get("code"):
+                    if self._is_already_logged_in(data, msg.data):
+                        _LOGGER.info(
+                            "Hub %s already logged in; proceeding", self._serial
+                        )
+                        return True
                     _LOGGER.warning(
                         "Hub %s local login rejected: %s",
                         self._serial, err.get("data") or err.get("message"),
@@ -430,6 +460,32 @@ class EzloHubConnection:
         err = data.get("error")
         return isinstance(err, dict) and bool(err.get("code"))
 
+    @staticmethod
+    def _is_already_logged_in(data: dict[str, Any], raw: str) -> bool:
+        """True when offline-login was rejected only because the hub's global
+        ``logged_in`` flag is still set from a prior session.
+
+        The hub clears that flag only when the last ws client disconnects
+        gracefully; after an ungraceful drop (TCP reset, or the controller
+        rebooting out from under the socket) it stays set, and the next
+        ``hub.offline.login.ui`` returns ``user.login.alreadylogged``. In that
+        state the hub accepts methods WITHOUT a fresh login, so treating this as
+        "logged in, proceed" keeps a reachable hub online across reboots instead
+        of dropping it to the NMA relay. If the hub really isn't usable, the data
+        watchdog drops the socket when no data arrives and we retry.
+        """
+        # Key off the message marker, NOT the code: the hub uses the same
+        # -32500 for a genuine "Bad password" rejection, so only the
+        # ``user.login.alreadylogged`` data/message means the sticky flag.
+        err = data.get("error")
+        if isinstance(err, dict):
+            text = str(err.get("data") or err.get("message") or "").lower()
+            if "alreadylog" in text:
+                return True
+        # Fall back to the raw frame for the duplicate-"error":null masking case
+        # (same reason '"error":{' is checked in _local_login).
+        return "alreadylog" in raw.lower()
+
     async def _async_run_session(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         """Send the initial queries, keep the socket alive, and stream updates.
 
@@ -442,12 +498,14 @@ class EzloHubConnection:
         falls back to the NMA relay instead of sitting on a dead link.
         """
         self._session_got_data = False
+        self._last_rx = self._hass.loop.time()
         await self._send_queries()
         keepalive = asyncio.ensure_future(self._async_keepalive())
         watchdog = asyncio.ensure_future(self._async_data_watchdog(ws))
         try:
             async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
+                    self._last_rx = self._hass.loop.time()
                     data = self._parse(msg.data)
                     if data is None:
                         continue
@@ -461,13 +519,33 @@ class EzloHubConnection:
             raise RuntimeError(f"hub {self._serial} delivered no data after login")
 
     async def _async_data_watchdog(self, ws: aiohttp.ClientWebSocketResponse) -> None:
-        """Drop the socket if no data arrives within the ready window."""
+        """Drop the socket if the hub stops delivering data.
+
+        Two phases. First a readiness check: a socket that logs in but never
+        delivers within the ready window is dropped so the supervisor can fall
+        back. Then a continuous liveness check: the keepalive queries the hub
+        every ``_KEEPALIVE_INTERVAL``, so if no frame has arrived for
+        ``_LIVENESS_TIMEOUT`` the board has gone (reboot / WiFi drop / half-open
+        socket). Dropping the socket makes entities go unavailable and the
+        supervisor reconnect promptly, instead of the read loop blocking on a
+        dead socket until the OS TCP timeout while HA shows stale values.
+        """
         await asyncio.sleep(_READY_TIMEOUT)
         if not self._session_got_data:
             _LOGGER.warning(
                 "Hub %s connected but sent no data; dropping to fall back", self._serial
             )
             await ws.close()
+            return
+        while True:
+            await asyncio.sleep(_LIVENESS_CHECK_INTERVAL)
+            if self._hass.loop.time() - self._last_rx > _LIVENESS_TIMEOUT:
+                _LOGGER.warning(
+                    "Hub %s silent for >%ss; dropping stale socket to reconnect",
+                    self._serial, _LIVENESS_TIMEOUT,
+                )
+                await ws.close()
+                return
 
     async def _send_queries(self) -> None:
         for query in get_devices_info():

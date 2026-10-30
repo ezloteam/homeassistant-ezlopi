@@ -12,7 +12,14 @@ sync-to-github:
   stage: sync
   image: alpine:latest
   before_script:
-    - apk add --no-cache git curl jq
+    - apk add --no-cache git curl jq openssh-client
+    # Auth to the GitHub mirror with a REPO-SCOPED write DEPLOY KEY (GITHUB_DEPLOY_KEY,
+    # a protected file var holding the private key). No account-wide PAT. Route SSH
+    # over ssh.github.com:443 so runners that block outbound :22 still work.
+    - mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+    - cp "$GITHUB_DEPLOY_KEY" "$HOME/.ssh/id_ed25519" && chmod 600 "$HOME/.ssh/id_ed25519"
+    - printf 'Host github.com\n  HostName ssh.github.com\n  Port 443\n  User git\n  IdentitiesOnly yes\n  IdentityFile %s/.ssh/id_ed25519\n' "$HOME" > "$HOME/.ssh/config"
+    - ssh-keyscan -p 443 -t ed25519,rsa ssh.github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
   only:
     - master
   script:
@@ -20,8 +27,8 @@ sync-to-github:
     - git config --global user.email "ci@ezlo.com"
     - git config --global user.name "eZLO CI"
 
-    # Add GitHub remote
-    - git remote add github "https://${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git" || git remote set-url github "https://${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git"
+    # Add GitHub remote (SSH; auth via the deploy key configured in before_script)
+    - git remote add github "git@github.com:${GITHUB_REPO}.git" || git remote set-url github "git@github.com:${GITHUB_REPO}.git"
 
     # Fetch GitHub master to compare
     - git fetch github master || true
@@ -128,39 +135,23 @@ sync-to-github:
     # Force push to GitHub master (squashed history)
     - git push github HEAD:master --force
 
-    # Publish a GitHub release so HACS picks up the version. The release tag
-    # equals custom_components/ezlopi/manifest.json's `version`; we create it
-    # only when no release for that version exists yet, so bumping the manifest
-    # version is what cuts a new release. Tags are created GitHub-side because
-    # the sync only force-pushes the master branch (never tags).
+    # Cut a release for HACS by PUSHING A TAG (the deploy key can push tags; it
+    # can't call the REST API). The tag == custom_components/ezlopi/manifest.json's
+    # `version`, pushed only when it doesn't already exist, so bumping the manifest
+    # version cuts a new release. The GitHub Actions workflow .github/workflows/
+    # release.yml turns the tag into a GitHub Release using Actions' own
+    # repo-scoped token — so no PAT is stored anywhere for releases either.
     - |
       set +o pipefail 2>/dev/null || true
       VERSION=$(jq -r '.version // empty' custom_components/ezlopi/manifest.json)
-      RELEASE_SHA=$(git rev-parse HEAD)
       if [ -z "$VERSION" ]; then
-        echo "No version in manifest.json; skipping GitHub release."
+        echo "No version in manifest.json; skipping release tag."
+      elif [ -n "$(git ls-remote --tags github "refs/tags/${VERSION}" 2>/dev/null)" ]; then
+        echo "Tag ${VERSION} already exists on GitHub; nothing to do."
       else
-        HTTP=$(curl -s -o /tmp/rel.json -w '%{http_code}' \
-          -H "Authorization: token ${GITHUB_TOKEN}" \
-          "https://api.github.com/repos/${GITHUB_REPO}/releases/tags/${VERSION}")
-        if [ "$HTTP" = "200" ]; then
-          echo "GitHub release ${VERSION} already exists; nothing to do."
-        else
-          echo "Creating GitHub release ${VERSION} at ${RELEASE_SHA}"
-          BODY=$(jq -nc --arg t "$VERSION" --arg s "$RELEASE_SHA" --arg n "$VERSION" \
-            '{tag_name:$t, target_commitish:$s, name:$n, body:"Automated release cut from the GitLab sync for HACS.", draft:false, prerelease:false, generate_release_notes:false}')
-          CODE=$(curl -s -o /tmp/rel_create.json -w '%{http_code}' -X POST \
-            -H "Authorization: token ${GITHUB_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${GITHUB_REPO}/releases" -d "$BODY")
-          if [ "$CODE" = "201" ]; then
-            echo "Created GitHub release ${VERSION}"
-          else
-            echo "ERROR: release creation failed (HTTP $CODE):"
-            cat /tmp/rel_create.json
-            exit 1
-          fi
-        fi
+        echo "Tagging ${VERSION} at $(git rev-parse HEAD) and pushing; GitHub Actions will cut the release."
+        git tag "${VERSION}" HEAD
+        git push github "refs/tags/${VERSION}"
       fi
 
   environment:

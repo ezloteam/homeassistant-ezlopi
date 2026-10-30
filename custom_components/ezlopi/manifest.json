@@ -1,7 +1,7 @@
 {
   "domain": "ezlopi",
   "name": "ezloPi",
-  "version": "1.6.0",
+  "version": "1.6.2",
   "requirements": [],
   "dependencies": [],
   "codeowners": [ "@ezloteam" ],
