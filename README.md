@@ -49,6 +49,24 @@ mapped to a Home Assistant entity by its type/category.
 There are no custom services/actions — entities use the standard Home Assistant
 services for their domain (`light.turn_on`, `lock.lock`, etc.).
 
+### Firmware updates
+
+Each controller gets an `update` entity. The image to flash is decided
+**server-side** by the Ezlo firmware catalog: the integration sends what the hub
+reports (`model`, `hardware`, installed `version`) and the catalog returns the
+one correct image, or nothing. The server does the version compare and never
+offers a downgrade, and an unknown product is never offered an image — so a hub
+is never handed a wrong or generic binary. If the catalog can't be reached the
+last known answer is kept, and installing when nothing is offered is refused.
+
+This path is governed by a remote feature flag (`firmware_catalog`, ON by
+default) fetched from the Ezlo feature-flag service, with a bundled snapshot as
+the offline default. If the flag is turned OFF, the integration falls back to
+the legacy behaviour of reading the public `dl.mios.com` manifest and choosing
+the image client-side. Flags are advisory and best-effort: they never block
+setup, and the last known value is used (and persisted) when the service is
+unreachable.
+
 ## Installation
 
 ### HACS (recommended)

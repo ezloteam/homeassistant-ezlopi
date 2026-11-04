@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -169,14 +170,25 @@ def _parse_manifest(payload: object) -> FirmwareManifest | None:
 
 
 class EzloFirmwareCoordinator(DataUpdateCoordinator[FirmwareManifest | None]):
-    """Fetches and parses the ezloPi firmware manifest.
+    """Fetches and parses the ezloPi firmware manifest (LEGACY fallback path).
 
     Fetch/parse failures are non-fatal: the last known manifest is retained
     (``None`` until the first success), so a dl.mios.com outage never breaks the
     integration or the update entities.
+
+    This is the pre-catalog path, used only when the ``firmware_catalog`` feature
+    flag is OFF. ``is_active`` gates the network fetch so that, with the flag ON
+    (the default), new clients do not read the dl.mios.com manifest at all — it
+    is now published only as a compatibility shim for builds already in the field.
+    When ``is_active`` is None the coordinator always fetches (used in tests).
     """
 
-    def __init__(self, hass: HomeAssistant, session: aiohttp.ClientSession) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        session: aiohttp.ClientSession,
+        is_active: Callable[[], bool] | None = None,
+    ) -> None:
         super().__init__(
             hass,
             _LOGGER,
@@ -184,8 +196,12 @@ class EzloFirmwareCoordinator(DataUpdateCoordinator[FirmwareManifest | None]):
             update_interval=_REFRESH_INTERVAL,
         )
         self._session = session
+        self._is_active = is_active
 
     async def _async_update_data(self) -> FirmwareManifest | None:
+        if self._is_active is not None and not self._is_active():
+            # Catalog path is active; don't fetch the legacy manifest.
+            return self.data
         # Cache-bust like the vendor app so the check sees the current manifest.
         url = f"{EZLOPI_FIRMWARE_MANIFEST_URL}?t={int(time.time())}"
         try:

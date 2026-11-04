@@ -52,6 +52,9 @@
         },
         "firmware_update_timeout": {
             "message": "Firmware update for controller {serial} did not complete in time."
+        },
+        "firmware_no_update_offered": {
+            "message": "No firmware update is being offered for controller {serial} right now."
         }
     },
     "issues": {

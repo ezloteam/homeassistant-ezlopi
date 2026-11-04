@@ -163,7 +163,12 @@ async def test_manifest_missing_version(hass: HomeAssistant) -> None:
 
 # ---- update entity ----
 
+from custom_components.ezlopi.catalog import FirmwareDecision
+
+
 class _FakeFirmware:
+    """Stand-in for the legacy manifest coordinator."""
+
     def __init__(self, data: FirmwareManifest | None) -> None:
         self.data = data
 
@@ -171,55 +176,158 @@ class _FakeFirmware:
         return lambda: None
 
 
+class _FakeDecision:
+    """Stand-in for the per-hub firmware-catalog decision coordinator."""
+
+    def __init__(self, data: FirmwareDecision | None) -> None:
+        self.data = data
+        self.refreshes = 0
+
+    def async_add_listener(self, _cb: Any) -> Any:
+        return lambda: None
+
+    async def async_request_refresh(self) -> None:
+        self.refreshes += 1
+
+
+class _FakeFlags:
+    """Stand-in for the feature-flags client."""
+
+    def __init__(self, enabled: bool) -> None:
+        self._enabled = enabled
+
+    def is_enabled(self, _key: str) -> bool:
+        return self._enabled
+
+
+_DECISION = FirmwareDecision(
+    update_available=True, target_version="5.7.22",
+    file_url="http://x/new.bin", file_md5="md5", reason="channel",
+)
+
+
 def _light_coord(hass: HomeAssistant) -> Any:
     return make_coordinator(hass, [make_item("dm", "d", "dimmer", 0, "int")],
                             [make_device("d", "Dim", "")])
 
 
-def _entity(hass: HomeAssistant, data: FirmwareManifest | None, coord: Any = None) -> Any:
+def _entity(
+    hass: HomeAssistant,
+    *,
+    manifest: FirmwareManifest | None = None,
+    decision: FirmwareDecision | None = None,
+    flag_on: bool = True,
+    coord: Any = None,
+) -> Any:
     coord = coord or _light_coord(hass)
-    e = EzloFirmwareUpdate(coord, _FakeFirmware(data))  # type: ignore[arg-type]
+    e = EzloFirmwareUpdate(
+        coord,
+        _FakeFirmware(manifest),  # type: ignore[arg-type]
+        _FakeDecision(decision),  # type: ignore[arg-type]
+        _FakeFlags(flag_on),  # type: ignore[arg-type]
+    )
     e.hass = hass
     e.async_write_ha_state = lambda: None  # type: ignore[method-assign]
     return e
 
 
-async def test_update_entity_installed_and_latest(hass: HomeAssistant) -> None:
-    entity = _entity(hass, _MANIFEST)
+# ---- catalog path (flag ON, the default) ----
+
+async def test_update_entity_catalog_latest(hass: HomeAssistant) -> None:
+    entity = _entity(hass, decision=_DECISION, flag_on=True)
     assert entity.installed_version == "4.1.6"
-    assert entity.latest_version == "5.7.15"
+    assert entity.latest_version == "5.7.22"
     assert entity.available is True
     assert entity.unique_id == f"{SERIAL}_firmware"
     # Firmware lives on the single per-controller device (keyed by serial).
     assert (DOMAIN, SERIAL) in entity.device_info["identifiers"]
 
 
-async def test_update_entity_latest_falls_back_when_no_manifest(hass: HomeAssistant) -> None:
-    entity = _entity(hass, None)
+async def test_update_entity_catalog_no_offer_falls_back_to_installed(hass: HomeAssistant) -> None:
+    # update_available=false -> latest equals installed (no spurious update).
+    none_offered = FirmwareDecision(False, None, None, None, "unknown_product")
+    entity = _entity(hass, decision=none_offered, flag_on=True)
+    assert entity.latest_version == entity.installed_version == "4.1.6"
+    # No decision yet (None) also falls back.
+    assert _entity(hass, decision=None, flag_on=True).latest_version == "4.1.6"
+
+
+async def test_install_catalog_sends_decision_image(hass: HomeAssistant) -> None:
+    import asyncio
+    coord = _light_coord(hass)
+    entity = _entity(hass, decision=_DECISION, flag_on=True, coord=coord)
+    task = asyncio.ensure_future(entity.async_install(version=None, backup=False))
+    await asyncio.sleep(0)
+    # The exact image the server decided is sent, and install blocks.
+    assert ("firmware_update", ("5.7.22", "http://x/new.bin")) in coord.connection.sent
+    assert not task.done() and entity._installing is True
+    coord.connection.firmware = "5.7.22"
+    coord.async_update_listeners()
+    await task
+    assert entity._installing is False
+
+
+async def test_install_catalog_without_offer_raises(hass: HomeAssistant) -> None:
+    from homeassistant.exceptions import HomeAssistantError
+    for decision in (None, FirmwareDecision(False, None, None, None, "already_current")):
+        entity = _entity(hass, decision=decision, flag_on=True)
+        with pytest.raises(HomeAssistantError):
+            await entity.async_install(version=None, backup=False)
+        assert entity._installing is False
+
+
+async def test_reboot_requeries_catalog_decision(hass: HomeAssistant) -> None:
+    coord = _light_coord(hass)
+    entity = _entity(hass, decision=_DECISION, flag_on=True, coord=coord)
+    entity._last_seen_version = "4.1.6"
+    # Hub reboots onto a new firmware version -> the catalog answer changes.
+    coord.connection.firmware = "5.7.22"
+    entity._handle_coordinator_update()
+    await hass.async_block_till_done()
+    assert entity._decision.refreshes >= 1
+
+
+async def test_no_reboot_no_requery(hass: HomeAssistant) -> None:
+    coord = _light_coord(hass)
+    entity = _entity(hass, decision=_DECISION, flag_on=True, coord=coord)
+    entity._handle_coordinator_update()  # version unchanged
+    await hass.async_block_till_done()
+    assert entity._decision.refreshes == 0
+
+
+# ---- legacy manifest path (flag OFF) ----
+
+async def test_update_entity_manifest_latest(hass: HomeAssistant) -> None:
+    entity = _entity(hass, manifest=_MANIFEST, flag_on=False)
+    assert entity.installed_version == "4.1.6"
+    assert entity.latest_version == "5.7.15"
+
+
+async def test_update_entity_manifest_latest_falls_back(hass: HomeAssistant) -> None:
+    entity = _entity(hass, manifest=None, flag_on=False)
     assert entity.latest_version == entity.installed_version == "4.1.6"
 
 
 async def test_update_entity_unavailable_when_disconnected(hass: HomeAssistant) -> None:
     coord = _light_coord(hass)
     coord.connection.connected = False
-    entity = _entity(hass, _MANIFEST, coord)
+    entity = _entity(hass, decision=_DECISION, flag_on=True, coord=coord)
     assert entity.available is False
 
 
-async def test_install_sends_image_blocks_then_completes(hass: HomeAssistant) -> None:
+async def test_install_manifest_sends_image_blocks_then_completes(hass: HomeAssistant) -> None:
     import asyncio
     coord = _light_coord(hass)  # FakeConnection: chip esp32, 4.1.6, frankever dimmer
-    entity = _entity(hass, _MANIFEST, coord)
+    entity = _entity(hass, manifest=_MANIFEST, flag_on=False, coord=coord)
     task = asyncio.ensure_future(entity.async_install(version=None, backup=False))
     await asyncio.sleep(0)  # let it send the command and start waiting
-    # Correct image sent, and it is blocking (device not yet on target).
+    # Correct image selected client-side, and it is blocking.
     assert ("firmware_update", ("5.7.15", "http://x/dimmer.bin")) in coord.connection.sent
     assert not task.done()
     assert entity._installing is True
     # Available even while the hub is offline mid-flash (reboot).
     coord.connection.connected = False
     assert entity.available is True
-    # Device reboots onto the new version -> coordinator update releases install.
     coord.connection.firmware = "5.7.15"
     coord.async_update_listeners()
     await task
@@ -231,16 +339,16 @@ async def test_install_times_out_when_version_never_reached(hass: HomeAssistant)
 
     from custom_components.ezlopi import update as update_mod
     coord = _light_coord(hass)
-    entity = _entity(hass, _MANIFEST, coord)
+    entity = _entity(hass, decision=_DECISION, flag_on=True, coord=coord)
     with patch.object(update_mod, "_INSTALL_TIMEOUT", 0.05):
         with pytest.raises(HomeAssistantError):
             await entity.async_install(version=None, backup=False)
     assert entity._installing is False
 
 
-async def test_update_entity_install_without_manifest_raises(hass: HomeAssistant) -> None:
+async def test_update_entity_manifest_install_without_manifest_raises(hass: HomeAssistant) -> None:
     from homeassistant.exceptions import HomeAssistantError
-    entity = _entity(hass, None)
+    entity = _entity(hass, manifest=None, flag_on=False)
     with pytest.raises(HomeAssistantError):
         await entity.async_install(version=None, backup=False)
     assert entity._installing is False

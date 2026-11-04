@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_USERNAME, CONF_PASSWORD, Platform
@@ -13,17 +16,31 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.typing import ConfigType
+from homeassistant.loader import async_get_integration
 
+from .catalog import EzloFirmwareDecisionCoordinator
 from .connection import EzloHubConnection
 from .const import DOMAIN
 from .coordinator import EzloDataUpdateCoordinator
 from .ezlopi_utils import EzloAuthError, EzloCloudAPI
 from .firmware import EzloFirmwareCoordinator
+from .flags import FLAG_FIRMWARE_CATALOG, EzloFeatureFlags, flags_store
 from .mdns_connector import EzloPiMDSConnector
 
 _LOGGER = logging.getLogger(__name__)
 
 DATA_BROWSER = "browser"
+
+
+def _load_flags_snapshot() -> dict[str, Any] | None:
+    """Read the bundled feature-flags snapshot (sync; call via executor)."""
+    path = Path(__file__).parent / "flags_snapshot.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as err:  # missing/corrupt — fall to compiled defaults
+        _LOGGER.debug("feature-flags snapshot unreadable: %s", err)
+        return None
+    return data if isinstance(data, dict) else None
 
 # Overall cap on waiting for hubs to deliver initial data during setup. Setup
 # never blocks longer than this regardless of how many hubs are slow/offline.
@@ -47,7 +64,11 @@ class EzloRuntimeData:
 
     api: EzloCloudAPI
     firmware: EzloFirmwareCoordinator
+    flags: EzloFeatureFlags
     coordinators: list[EzloDataUpdateCoordinator] = field(default_factory=list)
+    firmware_decisions: dict[str, EzloFirmwareDecisionCoordinator] = field(
+        default_factory=dict
+    )
 
 
 EzloConfigEntry = ConfigEntry  # ConfigEntry[EzloRuntimeData] at type-check time
@@ -83,12 +104,35 @@ async def async_setup_entry(hass: HomeAssistant, entry: EzloConfigEntry) -> bool
     if not ok or not api.get_hub_list():
         raise ConfigEntryNotReady("No ezloPi hubs found for this account")
 
-    # Account-wide firmware release tracker (latest version from dl.mios.com).
-    # Best-effort: a failed fetch leaves latest_version unknown, never blocks setup.
-    firmware = EzloFirmwareCoordinator(hass, session)
+    # Remote feature flags (the kill switch the mobile apps use). Loaded from the
+    # bundled snapshot + persisted last-known, then refreshed live in the
+    # background — it must never block setup. The `firmware_catalog` flag selects
+    # the firmware update path (catalog decision vs legacy manifest).
+    integration = await async_get_integration(hass, DOMAIN)
+    bundled = await hass.async_add_executor_job(_load_flags_snapshot)
+    store = flags_store(hass, entry.entry_id)
+    cached = await store.async_load()
+    flags = EzloFeatureFlags(
+        hass,
+        session,
+        app_version=str(integration.version or ""),
+        device_id=entry.entry_id,  # stable opaque per-install id
+        token_provider=lambda: api.token,
+        bundled=bundled,
+        cached=cached,
+        store=store,
+    )
+    flags.start()
+
+    # Account-wide LEGACY firmware release tracker (latest version from
+    # dl.mios.com). Only fetches while the catalog flag is OFF; best-effort, a
+    # failed fetch leaves latest_version unknown and never blocks setup.
+    firmware = EzloFirmwareCoordinator(
+        hass, session, is_active=lambda: not flags.is_enabled(FLAG_FIRMWARE_CATALOG)
+    )
     await firmware.async_refresh()
 
-    runtime = EzloRuntimeData(api=api, firmware=firmware)
+    runtime = EzloRuntimeData(api=api, firmware=firmware, flags=flags)
     entry.runtime_data = runtime
 
     # Start every hub connection, then wait for initial data CONCURRENTLY with a
@@ -108,8 +152,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: EzloConfigEntry) -> bool
             name=hub.name,
         )
         coordinator = EzloDataUpdateCoordinator(hass, entry, connection)
+        # Per-hub server-side firmware decision (catalog path). Only fetches
+        # while the catalog flag is ON; the update entity drives its first fetch
+        # once the hub reports its firmware. Not awaited here — never blocks setup.
+        decision = EzloFirmwareDecisionCoordinator(
+            hass, session, connection,
+            is_active=lambda: flags.is_enabled(FLAG_FIRMWARE_CATALOG),
+        )
         connection.start()
         runtime.coordinators.append(coordinator)
+        runtime.firmware_decisions[hub.serial] = decision
 
     async def _wait_ready(coordinator: EzloDataUpdateCoordinator) -> None:
         try:
@@ -205,6 +257,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: EzloConfigEntry) -> boo
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     runtime: EzloRuntimeData | None = getattr(entry, "runtime_data", None)
     if runtime is not None:
+        runtime.flags.async_stop()
         for coordinator in runtime.coordinators:
             await coordinator.connection.async_stop()
     return unloaded

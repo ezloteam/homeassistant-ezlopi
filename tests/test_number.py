@@ -234,7 +234,7 @@ async def test_migration_removes_orphaned_strip_entities(hass: HomeAssistant) ->
             "number", DOMAIN, f"{SERIAL}_cnt", config_entry=entry).entity_id,
     ]
 
-    runtime = EzloRuntimeData(api=None, firmware=None, coordinators=[coord])  # type: ignore[arg-type]
+    runtime = EzloRuntimeData(api=None, firmware=None, flags=None, coordinators=[coord])  # type: ignore[arg-type]
     _async_remove_migrated_strip_entities(hass, entry, runtime)
 
     for entity_id in gone:

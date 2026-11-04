@@ -1,0 +1,1 @@
+{"flags":{"firmware_catalog":{"enabled":true,"reason":"default","value":null}},"generated_at":"2026-11-03T21:25:15Z","mode":"snapshot","schema":1,"scope":{"app":"ezlopi_homeassistant","app_version":null,"env":"live","oem":null,"platform":"homeassistant","subject":{"kind":"anonymous"}},"ttl_seconds":0,"version":"live-00000001"}

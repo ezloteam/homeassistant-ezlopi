@@ -15,5 +15,15 @@ EZLOPI_API = "EZLOPI_API"
 WS_API = "ws_api"
 LOCK = "lock"
 # Public ezloPi firmware release manifest — the same source the controllers use
-# for OTA. Its top-level `version` is the latest available firmware.
+# for OTA. Its top-level `version` is the latest available firmware. This is the
+# LEGACY path, kept only as a fallback behind the `firmware_catalog` feature flag
+# (OFF): new clients ask the firmware catalog instead and must not read this.
 EZLOPI_FIRMWARE_MANIFEST_URL = "https://dl.mios.com/ezloPI/manifest.json"
+# Server-side firmware catalog (cloud/firmware-catalog). GET /decision returns
+# the single image to flash for a product+version; the server does the compare
+# and never offers a downgrade. Anonymous, no token. This is the default path.
+EZLOPI_FIRMWARE_CATALOG_BASE = "https://api-cloud.ezlo.com/api/v4/firmware_catalog/1"
+# Remote feature-flag service (cloud/feature-flags). GET /flags returns a small
+# document of booleans (the kill switch the mobile apps use); GET /snapshot is
+# the same document with defaults, baked in as the offline fallback.
+EZLOPI_FEATURE_FLAGS_BASE = "https://api-cloud.ezlo.com/api/v4/feature_flags/1"
