@@ -609,3 +609,169 @@ async def test_async_stop(hass: HomeAssistant) -> None:
     await c.async_stop()
     assert c._closed is True
     assert ws.closed is True
+
+
+# ---- reconnect backoff (offline-hub storm fix) ----
+
+def test_backoff_delay_grows_and_caps() -> None:
+    f = EzloHubConnection._backoff_delay
+    # 0/1 consecutive failures keep the snappy base delay.
+    assert f(0) == float(conn_mod._RECONNECT_DELAY)
+    assert f(1) == float(conn_mod._RECONNECT_DELAY)
+    # then it doubles each consecutive failure...
+    assert f(2) == 10
+    assert f(3) == 20
+    assert f(4) == 40
+    # ...and caps at _RECONNECT_DELAY_MAX (80 -> 60), staying there.
+    assert f(5) == float(conn_mod._RECONNECT_DELAY_MAX)
+    assert f(20) == float(conn_mod._RECONNECT_DELAY_MAX)
+
+
+async def test_nma_register_failure_raises(hass: HomeAssistant) -> None:
+    # loginUserMios (ha_1) succeeds but register (ha_2) is rejected (the
+    # controller is offline / no longer in the account). The method must RAISE
+    # so the supervisor counts a failure and backs off, instead of silently
+    # returning and retrying at the flat base delay forever (the reconnect storm).
+    ws = _WS([
+        _Msg(aiohttp.WSMsgType.TEXT, json.dumps({"id": "ha_1", "result": {}})),
+        _Msg(aiohttp.WSMsgType.TEXT, json.dumps(
+            {"id": "ha_2",
+             "error": {"code": 13, "data": "cloud.error.controller_not_connected"}})),
+        _Msg(aiohttp.WSMsgType.CLOSED),
+    ])
+    c = _make_nma(hass, ws)
+    with pytest.raises(RuntimeError):
+        await c._async_connect_and_listen_nma("wss://nma-ui-cloud.ezlo.com/nma")
+    # nma_mode is cleared even when the handshake fails.
+    assert c._nma_mode is False
+
+
+# --- write coalescing (debounce) -------------------------------------------
+
+async def test_rapid_writes_coalesce_to_latest(hass: HomeAssistant) -> None:
+    """A burst to one item sends the first immediately, then one flush of the last.
+
+    The intermediate values are dropped — the hub processes sets serially, so a
+    fast colour/slider drag must not become one set per frame on the socket.
+    """
+    ws = _WS([])
+    c = _make(hass, ws)
+    c._ws = ws  # type: ignore[assignment]
+    c.items = [dict(i) for i in ITEMS]
+    try:
+        # First write goes out inline.
+        await c.async_set_item_value("i_light", 10)
+        # Rapid follow-ups collapse into the latest pending value.
+        await c.async_set_item_value("i_light", 20)
+        await c.async_set_item_value("i_light", 30)
+        assert len(ws.sent) == 1  # only the leading send so far
+        assert c._coalesced["i_light"] == 30
+        assert "i_light" in c._coalesce_handle  # a trailing flush is scheduled
+        # Optimistic local state reflects the latest during the drag.
+        assert next(i for i in c.items if i["_id"] == "i_light")["value"] == 30
+        # When the window elapses, exactly one more send carries the last value.
+        await c._flush_coalesced("i_light")
+        assert len(ws.sent) == 2
+        assert json.loads(ws.sent[1])["params"]["value"] == 30
+        assert "i_light" not in c._coalesced
+    finally:
+        for h in c._coalesce_handle.values():
+            h.cancel()
+
+
+async def test_coalesced_flush_via_timer_sends_latest(hass: HomeAssistant) -> None:
+    """The real timer path (call_later -> task) flushes the latest value."""
+    ws = _WS([])
+    c = _make(hass, ws)
+    c._ws = ws  # type: ignore[assignment]
+    c.items = [dict(i) for i in ITEMS]
+    with patch.object(conn_mod, "_COALESCE_INTERVAL", 0.02):
+        await c.async_set_item_value("i_light", 1)
+        await c.async_set_item_value("i_light", 2)
+        await c.async_set_item_value("i_light", 3)
+        await asyncio.sleep(0.08)  # let the timer fire and the flush task run
+    assert len(ws.sent) == 2
+    assert json.loads(ws.sent[1])["params"]["value"] == 3
+    assert "i_light" not in c._coalesce_handle
+
+
+async def test_isolated_writes_are_not_coalesced(hass: HomeAssistant) -> None:
+    """Writes spaced beyond the window each send inline (no coalescing)."""
+    ws = _WS([])
+    c = _make(hass, ws)
+    c._ws = ws  # type: ignore[assignment]
+    c.items = [dict(i) for i in ITEMS]
+    with patch.object(conn_mod, "_COALESCE_INTERVAL", 0.0):
+        await c.async_set_item_value("i_light", 10)
+        await c.async_set_item_value("i_light", 20)
+    assert len(ws.sent) == 2
+    assert not c._coalesce_handle
+
+
+async def test_async_stop_cancels_coalesce_timers(hass: HomeAssistant) -> None:
+    ws = _WS([])
+    c = _make(hass, ws)
+    c._ws = ws  # type: ignore[assignment]
+    c.items = [dict(i) for i in ITEMS]
+    await c.async_set_item_value("i_light", 10)
+    await c.async_set_item_value("i_light", 20)  # schedules a flush timer
+    assert c._coalesce_handle
+    await c.async_stop()
+    assert not c._coalesce_handle
+
+
+# --- keepalive clobber guard ------------------------------------------------
+
+def _keepalive_items(**overrides: Any) -> list[dict[str, Any]]:
+    items = [dict(i) for i in ITEMS]
+    for item in items:
+        if item["_id"] in overrides:
+            item["value"] = overrides[item["_id"]]
+    return items
+
+
+async def test_write_guard_keeps_recent_value_against_keepalive(
+    hass: HomeAssistant,
+) -> None:
+    """A re-query carrying a stale value for a just-written item is overridden."""
+    ws = _WS([])
+    c = _make(hass, ws)
+    c._ws = ws  # type: ignore[assignment]
+    c.items = [dict(i) for i in ITEMS]
+    await c.async_set_item_value("i_light", 99)
+    # Keepalive re-query: i_light still reads its OLD value (set not applied yet),
+    # i_switch genuinely changed on the device (not recently written by us).
+    c._handle({"id": "q", "result": {
+        "items": _keepalive_items(i_light=50, i_switch=False)}})
+    assert next(i for i in c.items if i["_id"] == "i_light")["value"] == 99  # kept
+    assert next(i for i in c.items if i["_id"] == "i_switch")["value"] is False  # taken
+
+
+async def test_write_guard_expires(hass: HomeAssistant) -> None:
+    """Past the guard window, the re-query value wins again."""
+    ws = _WS([])
+    c = _make(hass, ws)
+    c._ws = ws  # type: ignore[assignment]
+    c.items = [dict(i) for i in ITEMS]
+    await c.async_set_item_value("i_light", 99)
+    with patch.object(conn_mod, "_WRITE_GUARD_WINDOW", -1):
+        c._handle({"id": "q", "result": {"items": _keepalive_items(i_light=50)}})
+    assert next(i for i in c.items if i["_id"] == "i_light")["value"] == 50
+    assert not c._recent_writes  # expired entry pruned
+
+
+async def test_broadcast_clears_write_guard(hass: HomeAssistant) -> None:
+    """A real broadcast drops the guard so a later external value is accepted."""
+    ws = _WS([])
+    c = _make(hass, ws)
+    c._ws = ws  # type: ignore[assignment]
+    c.items = [dict(i) for i in ITEMS]
+    await c.async_set_item_value("i_light", 99)
+    # Authoritative real-time broadcast for the same item clears the guard.
+    c._handle({"id": "ui_broadcast", "msg_subclass": "hub.item.updated",
+               "result": {"_id": "i_light", "value": 7}})
+    assert next(i for i in c.items if i["_id"] == "i_light")["value"] == 7
+    assert "i_light" not in c._recent_writes
+    # A subsequent re-query value is now accepted (guard no longer in force).
+    c._handle({"id": "q", "result": {"items": _keepalive_items(i_light=50)}})
+    assert next(i for i in c.items if i["_id"] == "i_light")["value"] == 50

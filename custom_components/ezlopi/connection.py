@@ -25,6 +25,13 @@ _LOGGER = logging.getLogger(__name__)
 
 _LOGIN_METHOD = "hub.offline.login.ui"
 _RECONNECT_DELAY = 5
+# Reconnect backoff ceiling. A hub that keeps failing to connect (offline, or
+# removed from the account) must not retry at the flat base delay forever: with
+# several such hubs that is a steady storm of cloud (NMA) handshakes on the
+# shared event loop that competes with the healthy hubs' traffic. The delay
+# grows exponentially from _RECONNECT_DELAY up to this cap and resets to the
+# base once a session connects and delivers data.
+_RECONNECT_DELAY_MAX = 60
 _READY_TIMEOUT = 20
 # The hub closes idle sockets; keep traffic flowing well under that window.
 _KEEPALIVE_INTERVAL = 15
@@ -41,6 +48,19 @@ _UNREACHABLE_THRESHOLD = 3
 # After this many consecutive local misses/failures, fall back to the cloud
 # NMA relay (if configured) instead of the LAN websocket.
 _LOCAL_FALLBACK_THRESHOLD = 3
+# Coalesce rapid writes to the same item. The first set goes out immediately;
+# further sets to that item within this window are collapsed to the latest value
+# and flushed once when it elapses. A colour-wheel/slider drag can emit dozens of
+# sets per second, and an ezloPi hub processes sets serially on its ws thread, so
+# without this a drag floods the socket (the hub falls seconds behind, control
+# feels stuck). The window is short enough to be imperceptible for isolated use.
+_COALESCE_INTERVAL = 0.15
+# After writing an item, prefer the written value over a keepalive re-query's for
+# this long. A re-query (every _KEEPALIVE_INTERVAL) can carry a value the hub has
+# not applied yet for an item we just set, which would clobber the optimistic
+# value and snap the control back. Covers the hub's set-apply latency; a real-time
+# hub.item.updated broadcast still overrides immediately (it clears the guard).
+_WRITE_GUARD_WINDOW = 3.0
 
 
 class EzloHubConnection:
@@ -105,6 +125,13 @@ class EzloHubConnection:
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._run_task: asyncio.Task[None] | None = None
         self._closed = False
+
+        # Write coalescing + clobber-guard state (see _COALESCE_INTERVAL /
+        # _WRITE_GUARD_WINDOW). All touched only on the event loop.
+        self._last_sent_at: dict[str, float] = {}  # item id -> loop time of last send
+        self._coalesced: dict[str, Any] = {}  # item id -> latest value awaiting flush
+        self._coalesce_handle: dict[str, asyncio.TimerHandle] = {}
+        self._recent_writes: dict[str, tuple[float, Any]] = {}  # id -> (time, value)
         self._connected = False
         self._ready = asyncio.Event()
 
@@ -137,21 +164,71 @@ class EzloHubConnection:
 
     async def async_stop(self) -> None:
         self._closed = True
+        for handle in self._coalesce_handle.values():
+            handle.cancel()
+        self._coalesce_handle.clear()
         if self._ws is not None:
             await self._ws.close()
         if self._run_task is not None:
             self._run_task.cancel()
 
     async def async_set_item_value(self, item_id: str, value: Any) -> None:
-        await self._send(set_item_value_request(item_id, value))
-        # Reflect the change locally at once. The hub applies the set but does
-        # not reliably broadcast the new value, and the keepalive re-query is up
-        # to ~15s away, so without this the item keeps its old value: Home
-        # Assistant's optimistic control snaps straight back and the command
-        # looks like it did nothing. This mirrors a hub.item.updated broadcast
-        # (same raw value shape), so a later real broadcast/keepalive reconciles
-        # it cleanly. A failed _send raises above and never reaches here.
+        now = self._hass.loop.time()
+        last = self._last_sent_at.get(item_id)
+        throttled = item_id in self._coalesce_handle or (
+            last is not None and now - last < _COALESCE_INTERVAL
+        )
+        if not throttled:
+            # Isolated write (the common case): send immediately. A failed _send
+            # raises here and nothing is reflected locally, so a real error still
+            # surfaces to the caller.
+            await self._send(set_item_value_request(item_id, value))
+            self._last_sent_at[item_id] = self._hass.loop.time()
+            # Reflect the change locally at once. The hub applies the set but
+            # does not reliably broadcast the new value over the LAN ws, and the
+            # keepalive re-query is up to ~15s away, so without this the item
+            # keeps its old value and the optimistic control snaps back. A later
+            # real broadcast/keepalive reconciles it (guarded, see _note_write).
+            self._note_write(item_id, value)
+            self._update_item(item_id, value)
+            return
+        # A burst to the same item (colour-wheel / slider drag): collapse to the
+        # latest value and flush it once the window elapses, instead of sending
+        # every frame at the hub (which processes sets serially). Reflect the
+        # latest optimistically now so the control stays live during the drag.
+        self._coalesced[item_id] = value
+        self._note_write(item_id, value)
         self._update_item(item_id, value)
+        if item_id not in self._coalesce_handle and not self._closed:
+            delay = max(0.0, _COALESCE_INTERVAL - (now - (last or now)))
+            self._coalesce_handle[item_id] = self._hass.loop.call_later(
+                delay, self._flush_coalesced_soon, item_id
+            )
+
+    def _note_write(self, item_id: str, value: Any) -> None:
+        """Record an optimistic write so a stale keepalive re-query can't clobber it."""
+        self._recent_writes[item_id] = (self._hass.loop.time(), value)
+
+    def _flush_coalesced_soon(self, item_id: str) -> None:
+        """Timer callback: schedule the deferred send of the latest coalesced value."""
+        self._coalesce_handle.pop(item_id, None)
+        # Reserve the slot now so a write racing the task runs is coalesced (kept
+        # in order) rather than sent inline ahead of this flush.
+        self._last_sent_at[item_id] = self._hass.loop.time()
+        self._hass.loop.create_task(self._flush_coalesced(item_id))
+
+    async def _flush_coalesced(self, item_id: str) -> None:
+        """Send the latest coalesced value for ``item_id`` (deferred, best-effort)."""
+        if item_id not in self._coalesced:
+            return
+        value = self._coalesced.pop(item_id)
+        self._last_sent_at[item_id] = self._hass.loop.time()
+        try:
+            await self._send(set_item_value_request(item_id, value))
+        except Exception as err:  # noqa: BLE001 - deferred send; cannot surface
+            _LOGGER.debug(
+                "hub %s: coalesced set of %s failed: %s", self._serial, item_id, err
+            )
 
     async def _request(
         self, method: str, params: dict[str, Any], timeout: float
@@ -213,6 +290,22 @@ class EzloHubConnection:
     def _next_id(self) -> str:
         self._id_counter += 1
         return f"ha_{self._id_counter}"
+
+    @staticmethod
+    def _backoff_delay(failures: int) -> float:
+        """Reconnect delay with exponential backoff, capped at _RECONNECT_DELAY_MAX.
+
+        ``failures`` is the count of consecutive failed connect attempts; it is
+        reset to 0 by a successful, data-delivering session, so a healthy (or
+        merely flaky, briefly-connecting) hub keeps the snappy base delay while a
+        persistently unreachable one backs off and stops hammering the shared
+        event loop / cloud relay.
+        """
+        if failures <= 1:
+            return float(_RECONNECT_DELAY)
+        return float(
+            min(_RECONNECT_DELAY_MAX, _RECONNECT_DELAY * 2 ** min(failures - 1, 6))
+        )
 
     async def _send(self, payload: dict[str, Any]) -> None:
         if self._ws is None or self._ws.closed:
@@ -290,7 +383,7 @@ class EzloHubConnection:
                     translation_placeholders={"serial": self._serial},
                 )
             if not self._closed:
-                await asyncio.sleep(_RECONNECT_DELAY)
+                await asyncio.sleep(self._backoff_delay(failures))
 
     async def _async_connect_and_listen(self, url: str) -> None:
         """Connect over the LAN websocket, log in offline, then stream state."""
@@ -394,11 +487,18 @@ class EzloHubConnection:
                     logged_in = await asyncio.wait_for(
                         self._nma_login(ws), timeout=_READY_TIMEOUT
                     )
-                except (TimeoutError, asyncio.TimeoutError):
-                    _LOGGER.warning("Hub %s NMA login timed out", self._serial)
-                    return
-                if logged_in:
-                    await self._async_run_session(ws)
+                except (TimeoutError, asyncio.TimeoutError) as err:
+                    raise RuntimeError(
+                        f"hub {self._serial} NMA login timed out"
+                    ) from err
+                if not logged_in:
+                    # Register/login rejected (controller offline or no longer in
+                    # the account). Raise so the supervisor counts a failure and
+                    # backs off, instead of silently returning and retrying at the
+                    # flat base delay forever (which several offline hubs turn
+                    # into a steady NMA reconnect storm).
+                    raise RuntimeError(f"hub {self._serial} NMA login failed")
+                await self._async_run_session(ws)
         finally:
             self._nma_mode = False
 
@@ -582,6 +682,10 @@ class EzloHubConnection:
         # subclass directly rather than the id.
         if data.get("msg_subclass") == "hub.item.updated":
             result = data.get("result", {})
+            # A real broadcast is authoritative and real-time, so it wins over a
+            # pending write guard: drop the guard for this item so a later
+            # external change isn't suppressed by our stale written value.
+            self._recent_writes.pop(result.get("_id"), None)
             self._update_item(result.get("_id"), result.get("value"))
             return
 
@@ -595,7 +699,7 @@ class EzloHubConnection:
             self.model = result.get("model")
             changed = True
         if "items" in result:
-            self.items = result["items"]
+            self.items = self._apply_write_guard(result["items"])
             changed = True
         if "devices" in result:
             self.devices = result["devices"]
@@ -631,6 +735,33 @@ class EzloHubConnection:
                 item["value"] = value
                 break
         self._on_update()
+
+    def _apply_write_guard(
+        self, items: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Keep recently-written values in a keepalive re-query's items list.
+
+        A re-query can snapshot an item before the hub applied a set we just
+        sent, so its value would clobber the optimistic one and snap the control
+        back. Within _WRITE_GUARD_WINDOW of a write we override that item's value
+        with the written one; expired entries are pruned.
+        """
+        if not self._recent_writes:
+            return items
+        now = self._hass.loop.time()
+        self._recent_writes = {
+            iid: (ts, val)
+            for iid, (ts, val) in self._recent_writes.items()
+            if now - ts <= _WRITE_GUARD_WINDOW
+        }
+        if not self._recent_writes:
+            return items
+        for item in items:
+            iid = item.get("_id")
+            rec = self._recent_writes.get(iid) if iid is not None else None
+            if rec is not None:
+                item["value"] = rec[1]
+        return items
 
     def get_device_metadata(self, device_id: str) -> dict[str, Any]:
         meta: dict[str, Any] = self.device_metadata.get(device_id, {})
