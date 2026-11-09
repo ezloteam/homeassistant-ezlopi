@@ -207,6 +207,8 @@ def _async_remove_migrated_strip_entities(
       ``number`` entities; 1.6.0 makes it a config-category light.
     * 1.5.0: the ``effect`` item fell through to a ``sensor``; 1.6.0 folds it
       into the strip light (effect selector) + ``speed``/``intensity`` numbers.
+    * <=1.7.0: the ``cct`` item fell through to a ``sensor``; 1.8.0 folds it
+      into the strip light as the warm/cool whites of an RGBWW light.
     """
     stale: set[tuple[str, str]] = set()
     for coordinator in runtime.coordinators:
@@ -219,7 +221,7 @@ def _async_remove_migrated_strip_entities(
             elif item_type == "config_light_color":
                 for channel in ("red", "green", "blue", "cwhite"):
                     stale.add(("number", f"{serial}_{item_id}_{channel}"))
-            elif item_type == "light_effect":
+            elif item_type in ("light_effect", "light_cct"):
                 stale.add(("sensor", f"{serial}_{item_id}"))
     if not stale:
         return

@@ -9,6 +9,7 @@ from typing import Any
 from homeassistant.components.light import (
     ATTR_EFFECT,
     ATTR_RGBW_COLOR,
+    ATTR_RGBWW_COLOR,
     ColorMode,
     LightEntityFeature,
 )
@@ -54,6 +55,11 @@ def test_config_items_classified() -> None:
         {"name": "effect", "valueType": "dictionary", "hasSetter": True,
          "value": {"effect": "solid", "speed": 50, "intensity": 50}}
     )["platform"] == "light_effect"
+    # The RGBCCT warm/cool white item (a dictionary) folds into the light.
+    assert detect_device_platform(
+        {"name": "cct", "valueType": "dictionary", "hasSetter": True,
+         "value": {"warm": 0, "cool": 0}}
+    )["platform"] == "light_cct"
 
 
 def test_led_count_not_misread_as_light() -> None:
@@ -157,6 +163,71 @@ async def test_effect_select_is_read_modify_write(hass: HomeAssistant) -> None:
     )
 
 
+# ---- RGBCCT strip: dimmer + rgbcolor + cct -> one RGBWW light ----
+
+def _cct_coord(hass: HomeAssistant) -> Any:
+    """A device-0009 RGBCCT strip: runtime dimmer + rgbcolor + cct + effect."""
+    items = [
+        make_item("dm", "d", "dimmer", 50, "int"),
+        _rgb("rgb", "d", "rgbcolor", {"red": 1, "green": 2, "blue": 3, "cwhite": 4}),
+        make_item("cct", "d", "cct", {"warm": 10, "cool": 20}, "dictionary"),
+        make_item("ef", "d", "effect",
+                  {"effect": "solid", "speed": 50, "intensity": 50}, "dictionary"),
+    ]
+    return make_coordinator(hass, items, [make_device("d", "Strip", "")])
+
+
+async def test_cct_item_classified(hass: HomeAssistant) -> None:
+    coord = _cct_coord(hass)
+    assert coord.data["cct"]["type"] == "light_cct"
+
+
+async def test_rgbcct_strip_is_one_rgbww_light(hass: HomeAssistant) -> None:
+    coord = _cct_coord(hass)
+    lights: list[Any] = []
+    _setup_lights(coord, lambda e: lights.extend(e))
+    # dimmer + rgbcolor + cct collapse into a SINGLE light (not a stray second
+    # entity for the cct item).
+    assert len(lights) == 1
+    light = lights[0]
+    assert light.supported_color_modes == {ColorMode.RGBWW}
+    assert light.color_mode == ColorMode.RGBWW
+    # rgbww_color = (r, g, b, cold_white=cct.cool, warm_white=cct.warm).
+    assert light.rgbww_color == (1, 2, 3, 20, 10)
+    # Effect still folds in alongside the whites.
+    assert light.effect == "solid"
+    assert light.supported_features & LightEntityFeature.EFFECT
+
+
+async def test_rgbww_set_writes_rgb_and_cct(hass: HomeAssistant) -> None:
+    coord = _cct_coord(hass)
+    light = EzloLight(
+        coord, coord.data["dm"], coord.data["rgb"], cct_element=coord.data["cct"],
+    )
+    # HA sends (red, green, blue, cold_white, warm_white).
+    await light.async_turn_on(**{ATTR_RGBWW_COLOR: (5, 6, 7, 8, 9)})
+    # rgbcolor gets red/green/blue only (cwhite is vestigial on RGBCCT)...
+    assert coord.connection.sent[-2] == ("rgb", {"red": 5, "green": 6, "blue": 7})
+    # ...and the whites go to the cct item as {warm, cool} (warm<-warm_white,
+    # cool<-cold_white).
+    assert coord.connection.sent[-1] == ("cct", {"warm": 9, "cool": 8})
+
+
+async def test_rgbw_strip_without_cct_stays_rgbw(hass: HomeAssistant) -> None:
+    # No cct item -> the strip is an RGBW light driven by rgbcolor's cwhite,
+    # exactly as before (no regression).
+    coord = _strip_coord(hass)
+    lights: list[Any] = []
+    _setup_lights(coord, lambda e: lights.extend(e))
+    runtime = next(light for light in lights if light._color_id == "rgb")
+    assert runtime.supported_color_modes == {ColorMode.RGBW}
+    assert runtime.rgbww_color is None
+    await runtime.async_turn_on(**{ATTR_RGBW_COLOR: (10, 20, 30, 40)})
+    assert coord.connection.sent[-1] == (
+        "rgb", {"red": 10, "green": 20, "blue": 30, "cwhite": 40}
+    )
+
+
 # ---- number platform (led_count config + effect speed/intensity) ----
 
 async def test_number_platform_builds_led_count_and_effect_params(
@@ -239,5 +310,34 @@ async def test_migration_removes_orphaned_strip_entities(hass: HomeAssistant) ->
 
     for entity_id in gone:
         assert reg.async_get(entity_id) is None, f"{entity_id} should be removed"
+    for entity_id in survive:
+        assert reg.async_get(entity_id) is not None, f"{entity_id} must survive"
+
+
+async def test_migration_removes_orphaned_cct_sensor(hass: HomeAssistant) -> None:
+    from homeassistant.helpers import entity_registry as er
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    coord = _cct_coord(hass)  # dimmer "dm", rgbcolor "rgb", cct "cct", effect "ef"
+    entry = MockConfigEntry(domain=DOMAIN, data={}, unique_id="migration-cct")
+    entry.add_to_hass(hass)
+    reg = er.async_get(hass)
+
+    # <=1.7.0 exposed the cct dictionary item as a junk Sensor; 1.8.0 folds it
+    # into the RGBWW light, so the old sensor must be removed.
+    gone = reg.async_get_or_create(
+        "sensor", DOMAIN, f"{SERIAL}_cct", config_entry=entry).entity_id
+    # The runtime light (dimmer item) and the effect speed number survive.
+    survive = [
+        reg.async_get_or_create(
+            "light", DOMAIN, f"{SERIAL}_dm", config_entry=entry).entity_id,
+        reg.async_get_or_create(
+            "number", DOMAIN, f"{SERIAL}_ef_speed", config_entry=entry).entity_id,
+    ]
+
+    runtime = EzloRuntimeData(api=None, firmware=None, flags=None, coordinators=[coord])  # type: ignore[arg-type]
+    _async_remove_migrated_strip_entities(hass, entry, runtime)
+
+    assert reg.async_get(gone) is None, "old cct sensor should be removed"
     for entity_id in survive:
         assert reg.async_get(entity_id) is not None, f"{entity_id} must survive"

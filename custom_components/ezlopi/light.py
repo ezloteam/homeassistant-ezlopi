@@ -7,6 +7,7 @@ from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
     ATTR_EFFECT,
     ATTR_RGBW_COLOR,
+    ATTR_RGBWW_COLOR,
     ColorMode,
     LightEntity,
     LightEntityFeature,
@@ -25,6 +26,7 @@ PARALLEL_UPDATES = 0
 # Rendered locally on the strip; Home Assistant only selects the effect name.
 EFFECT_LIST = [
     "solid", "rainbow", "color_wipe", "breathe", "theater_chase", "gradient",
+    "speaking", "image",
 ]
 
 
@@ -59,6 +61,7 @@ def _setup_lights(
         #     with Home Assistant's native colour wheel instead of raw sliders.
         levels: dict[str, dict[str, Any]] = {}
         colors: dict[str, dict[str, Any]] = {}
+        ccts: dict[str, dict[str, Any]] = {}
         effects: dict[str, dict[str, Any]] = {}
         config_levels: dict[str, dict[str, Any]] = {}
         config_colors: dict[str, dict[str, Any]] = {}
@@ -70,6 +73,8 @@ def _setup_lights(
                 levels.setdefault(device_id, element)
             elif element["type"] == "light_color":
                 colors.setdefault(device_id, element)
+            elif element["type"] == "light_cct":
+                ccts.setdefault(device_id, element)
             elif element["type"] == "light_effect":
                 effects.setdefault(device_id, element)
             elif element["type"] == "config_light":
@@ -84,6 +89,7 @@ def _setup_lights(
             added.add(level["id"])
             new.append(EzloLight(
                 coordinator, level, colors.get(device_id),
+                cct_element=ccts.get(device_id),
                 effect_element=effects.get(device_id),
             ))
         for device_id, level in config_levels.items():
@@ -123,6 +129,7 @@ class EzloLight(EzloEntity, LightEntity):
         level_element: dict[str, Any],
         color_element: dict[str, Any] | None = None,
         *,
+        cct_element: dict[str, Any] | None = None,
         effect_element: dict[str, Any] | None = None,
         scale: int = 100,
         entity_category: EntityCategory | None = None,
@@ -132,13 +139,23 @@ class EzloLight(EzloEntity, LightEntity):
     ) -> None:
         super().__init__(coordinator, level_element)  # _device_id = level item
         self._color_id = color_element["id"] if color_element else None
+        self._cct_id = cct_element["id"] if cct_element else None
         self._effect_id = effect_element["id"] if effect_element else None
         # Full-brightness value on the ezloPi side: the runtime dimmer runs
         # 0-100, the boot-brightness item 0-255. HA brightness is always 0-255.
         self._scale = scale
-        # With an rgbcolor item the light is a full RGBW color light (rgb + an
-        # independent white channel); otherwise it's brightness-only.
-        if self._color_id is not None:
+        # Colour capability grows with the strip's items:
+        #   - rgbcolor + cct  -> RGBWW: rgb channels plus two INDEPENDENT white
+        #     channels (cold/warm), the exact RGBCCT (firmware led_type 5)
+        #     hardware. rgbcolor drives red/green/blue only here; the whites
+        #     come from the separate cct item.
+        #   - rgbcolor only   -> RGBW: rgb plus one white channel carried in the
+        #     rgbcolor item itself (cwhite), e.g. an SK6812 RGBW strip.
+        #   - neither         -> brightness-only.
+        if self._cct_id is not None and self._color_id is not None:
+            self._attr_color_mode = ColorMode.RGBWW
+            self._attr_supported_color_modes = {ColorMode.RGBWW}
+        elif self._color_id is not None:
             self._attr_color_mode = ColorMode.RGBW
             self._attr_supported_color_modes = {ColorMode.RGBW}
         # With an effect item the strip renders animations on-device; expose the
@@ -167,6 +184,27 @@ class EzloLight(EzloEntity, LightEntity):
             int(value.get("green", 0)),
             int(value.get("blue", 0)),
             int(value.get("cwhite", 0)),
+        )
+
+    @property
+    def rgbww_color(self) -> tuple[int, int, int, int, int] | None:
+        """Current colour as (red, green, blue, cold_white, warm_white), 0-255.
+
+        RGB comes from the rgbcolor item; the two whites from the independent
+        cct item — cold_white is cct ``cool``, warm_white is cct ``warm``.
+        """
+        if self._color_id is None or self._cct_id is None:
+            return None
+        rgb = self.coordinator.data.get(self._color_id, {}).get("value")
+        cct = self.coordinator.data.get(self._cct_id, {}).get("value")
+        if not isinstance(rgb, dict) or not isinstance(cct, dict):
+            return None
+        return (
+            int(rgb.get("red", 0)),
+            int(rgb.get("green", 0)),
+            int(rgb.get("blue", 0)),
+            int(cct.get("cool", 0)),
+            int(cct.get("warm", 0)),
         )
 
     def _effect_value(self) -> dict[str, Any]:
@@ -227,8 +265,22 @@ class EzloLight(EzloEntity, LightEntity):
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         # Colour is independent of power — write it any time; it's visible once
-        # brightness > 0. (cwhite is a no-op on non-RGBW strips, real on RGBW.)
-        if self._color_id is not None and ATTR_RGBW_COLOR in kwargs:
+        # brightness > 0.
+        # RGBCCT strip: rgbcolor carries ONLY red/green/blue (its cwhite field is
+        # vestigial on this device); the two whites go to the separate cct item
+        # as {warm, cool}. HA sends cold_white then warm_white.
+        if self._cct_id is not None and ATTR_RGBWW_COLOR in kwargs:
+            red, green, blue, cold_white, warm_white = kwargs[ATTR_RGBWW_COLOR]
+            if self._color_id is not None:
+                await self._async_set_value(self._color_id, {
+                    "red": int(red), "green": int(green), "blue": int(blue),
+                })
+            await self._async_set_value(self._cct_id, {
+                "warm": int(warm_white), "cool": int(cold_white),
+            })
+        # RGBW strip: rgbcolor carries the single white channel in cwhite (real
+        # on RGBW strips, a no-op on plain RGB).
+        elif self._color_id is not None and ATTR_RGBW_COLOR in kwargs:
             red, green, blue, white = kwargs[ATTR_RGBW_COLOR]
             await self._async_set_value(self._color_id, {
                 "red": int(red), "green": int(green),

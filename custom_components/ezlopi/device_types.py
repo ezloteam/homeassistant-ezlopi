@@ -218,6 +218,15 @@ def detect_device_platform(device_info: dict[str, Any]) -> dict[str, Any]:
     if name_exact == "effect" and device_info.get("valueType") == "dictionary":
         return {"platform": "light_effect", "device_class": None}
 
+    # The device-0009 RGBCCT strip (firmware led_type 5) exposes a ``cct``
+    # dictionary item ({warm, cool}, each 0-255) for its two independent white
+    # channels. Its presence is what makes the strip tunable-white: it folds
+    # into the strip's light entity as the warm/cool whites of an RGBWW light
+    # (see light._setup_lights). It must not fall through to the value-type
+    # rules, which would call a dictionary a sensor.
+    if name_exact == "cct" and device_info.get("valueType") == "dictionary":
+        return {"platform": "light_cct", "device_class": None}
+
     # 1. Check explicit device type first
     device_type = device_info.get("deviceType") or device_info.get("device_type")
     if device_type and device_type in DEVICE_TYPE_MAP:

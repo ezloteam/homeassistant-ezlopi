@@ -38,7 +38,7 @@ mapped to a Home Assistant entity by its type/category.
 
 | Home Assistant platform | ezloPi items |
 |---|---|
-| `light` | Dimmers (brightness 0–100 → 0–255) and RGBW colour strips (colour wheel + white channel). A strip with the on-device effect engine also exposes its animations (`solid`, `rainbow`, `color_wipe`, `breathe`, `theater_chase`, `gradient`) via the light's native effect selector. On an LED strip the power-on indicator is a second, config-category light named **Boot color** so its boot colour/brightness is set with the same native picker. |
+| `light` | Dimmers (brightness 0–100 → 0–255) and colour strips. An RGBW strip exposes a colour wheel + one white channel; an **RGBCCT** strip (with independent warm/cool white) exposes an RGBWW light whose two white channels are tuned separately from the RGB colour. A strip with the on-device effect engine also exposes its animations (`solid`, `rainbow`, `color_wipe`, `breathe`, `theater_chase`, `gradient`, `speaking`, `image`) via the light's native effect selector. On an LED strip the power-on indicator is a second, config-category light named **Boot color** so its boot colour/brightness is set with the same native picker. |
 | `switch` | On/off switches and outlets |
 | `number` | LED-strip **LED count** (configuration) and the effect engine's **speed**/**intensity** |
 | `sensor` | Numeric/measurement items (temperature, humidity, battery, power, …) |
