@@ -230,6 +230,19 @@ class EzloHubConnection:
                 "hub %s: coalesced set of %s failed: %s", self._serial, item_id, err
             )
 
+    async def async_send_item_value(self, item_id: str, value: Any) -> None:
+        """Send an item value WITHOUT optimistic local update or coalescing.
+
+        For write-only items whose reported value is not the value you write:
+        the device-0009 ``canvas`` framebuffer reads back the strip geometry
+        (``{width,height,pixels}``), so reflecting the written ``{start,rgb}``
+        payload locally would corrupt the sensor's displayed value, and the
+        firmware sends no broadcast on a canvas write to reconcile it. Each
+        write is also an independent blit of a pixel run, so they must never be
+        coalesced (that would drop earlier chunks). Raises if not connected.
+        """
+        await self._send(set_item_value_request(item_id, value))
+
     async def _request(
         self, method: str, params: dict[str, Any], timeout: float
     ) -> dict[str, Any] | None:

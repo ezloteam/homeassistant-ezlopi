@@ -52,6 +52,7 @@ class FakeConnection:
         self.model = "ezlopi_frankever_us_wb01d-01b"
         self._on_update = kwargs.get("on_update", lambda: None)
         self.sent: list[tuple[str, Any]] = []
+        self.raw_sent: list[tuple[str, Any]] = []
 
     def start(self) -> None:
         return
@@ -64,6 +65,10 @@ class FakeConnection:
 
     async def async_set_item_value(self, item_id: str, value: Any) -> None:
         self.sent.append((item_id, value))
+
+    async def async_send_item_value(self, item_id: str, value: Any) -> None:
+        # Raw send (no optimistic update / no coalescing) used for canvas writes.
+        self.raw_sent.append((item_id, value))
 
     async def async_start_firmware_update(self, version: str, url: str) -> None:
         self.sent.append(("firmware_update", (version, url)))

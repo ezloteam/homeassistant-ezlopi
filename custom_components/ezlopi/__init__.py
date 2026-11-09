@@ -26,6 +26,7 @@ from .ezlopi_utils import EzloAuthError, EzloCloudAPI
 from .firmware import EzloFirmwareCoordinator
 from .flags import FLAG_FIRMWARE_CATALOG, EzloFeatureFlags, flags_store
 from .mdns_connector import EzloPiMDSConnector
+from .services import async_register_services
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -80,6 +81,10 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     await browser.async_init(hass)
     await browser.async_get_service_info()
     hass.data[DOMAIN] = {DATA_BROWSER: browser}
+    # Account-wide custom services (canvas framebuffer writes). Registered once
+    # for the integration; the handlers resolve the target hub/coordinator at
+    # call time, so a hub that isn't loaded yet gives a clean error.
+    async_register_services(hass)
     return True
 
 

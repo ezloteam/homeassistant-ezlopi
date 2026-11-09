@@ -62,5 +62,39 @@
             "title": "ezloPi hub {serial} is unreachable",
             "description": "Home Assistant can't reach ezloPi hub {serial} on the local network. Check that the hub is powered on, connected to the same network as Home Assistant, and discoverable via mDNS (_ezlo._tcp). The hub will reconnect automatically once reachable."
         }
+    },
+    "services": {
+        "set_canvas": {
+            "name": "Set canvas",
+            "description": "Write a run of pixels to an LED strip's canvas framebuffer, putting it into the on-device image effect. Call repeatedly to draw an arbitrary image. Tip: lower brightness (around 30) renders dense multi-colour images most truly; the firmware only raises brightness to a visible floor if it was 0.",
+            "fields": {
+                "entity_id": {
+                    "name": "Strip",
+                    "description": "The LED strip to draw on (its light entity or its canvas sensor)."
+                },
+                "start": {
+                    "name": "Start pixel",
+                    "description": "Index of the first pixel in this run (chain/row-major order)."
+                },
+                "rgb": {
+                    "name": "Pixels (hex)",
+                    "description": "Pixel colours as hex, 6 characters (RRGGBB) per pixel, one run in chain order. Spaces are ignored."
+                }
+            }
+        },
+        "draw_image": {
+            "name": "Draw image",
+            "description": "Load an image file, resize it to the LED strip's pixel geometry and draw it onto the canvas.",
+            "fields": {
+                "entity_id": {
+                    "name": "Strip",
+                    "description": "The LED strip to draw on (its light entity or its canvas sensor)."
+                },
+                "image": {
+                    "name": "Image path",
+                    "description": "Path to an image file. Its directory must be in allowlist_external_dirs (e.g. /config/www)."
+                }
+            }
+        }
     }
 }
