@@ -155,3 +155,54 @@ async def test_setup_cloud_connection_error_retries(hass: HomeAssistant) -> None
         await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
     assert entry.state is ConfigEntryState.SETUP_RETRY
+
+
+async def test_periodic_refresh_reloads_when_hub_added(hass: HomeAssistant) -> None:
+    """A hub appearing in the account after startup triggers an entry reload."""
+    from datetime import timedelta
+
+    from homeassistant.util import dt as dt_util
+    from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+    from custom_components.ezlopi import _HUBLIST_REFRESH_INTERVAL
+    from custom_components.ezlopi.ezlopi_utils import EzloPIHubInfo
+
+    entry = _entry()
+    await _setup(hass, entry)
+    assert entry.state is ConfigEntryState.LOADED
+
+    # The account gains a freshly provisioned controller after startup.
+    api = entry.runtime_data.api
+    api._hubs = dict(api._hubs)
+    api._hubs["105203948"] = EzloPIHubInfo("105203948", "k", "Bench", nma_url=None)
+
+    with patch(
+        "homeassistant.config_entries.ConfigEntries.async_schedule_reload"
+    ) as reload:
+        async_fire_time_changed(
+            hass, dt_util.utcnow() + _HUBLIST_REFRESH_INTERVAL + timedelta(seconds=1)
+        )
+        await hass.async_block_till_done()
+    reload.assert_called_once_with(entry.entry_id)
+
+
+async def test_periodic_refresh_no_reload_when_unchanged(hass: HomeAssistant) -> None:
+    """When the hub set is identical, the periodic refresh never reloads."""
+    from datetime import timedelta
+
+    from homeassistant.util import dt as dt_util
+    from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+    from custom_components.ezlopi import _HUBLIST_REFRESH_INTERVAL
+
+    entry = _entry()
+    await _setup(hass, entry)
+
+    with patch(
+        "homeassistant.config_entries.ConfigEntries.async_schedule_reload"
+    ) as reload:
+        async_fire_time_changed(
+            hass, dt_util.utcnow() + _HUBLIST_REFRESH_INTERVAL + timedelta(seconds=1)
+        )
+        await hass.async_block_till_done()
+    reload.assert_not_called()

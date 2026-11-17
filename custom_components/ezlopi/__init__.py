@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.loader import async_get_integration
 
@@ -46,6 +48,12 @@ def _load_flags_snapshot() -> dict[str, Any] | None:
 # Overall cap on waiting for hubs to deliver initial data during setup. Setup
 # never blocks longer than this regardless of how many hubs are slow/offline.
 _SETUP_READY_TIMEOUT = 12
+
+# How often to re-poll the account's controller list so a hub added after
+# startup (e.g. a freshly provisioned board) is picked up automatically. The
+# call is a cheap cloud list fetch; the entry is only reloaded when the set of
+# serials actually changes, so steady state costs nothing.
+_HUBLIST_REFRESH_INTERVAL = timedelta(minutes=10)
 
 PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
@@ -195,6 +203,37 @@ async def async_setup_entry(hass: HomeAssistant, entry: EzloConfigEntry) -> bool
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     _async_remove_stale_devices(hass, entry, runtime)
     _async_remove_migrated_strip_entities(hass, entry, runtime)
+
+    async def _async_refresh_hub_list(_now: datetime) -> None:
+        """Re-fetch the controller list; reload the entry if the hub set changed.
+
+        Platforms bind their coordinators once at setup, so a hub that joins the
+        account after startup only surfaces through a config-entry reload. We
+        detect that by comparing serials and reload only on a real change, never
+        on every tick. Any fetch error is swallowed so the timer keeps running.
+        """
+        try:
+            ok = await api.fetch_hub_list()
+        except Exception as err:  # noqa: BLE001 - never let the periodic timer die
+            _LOGGER.debug("ezloPi hub-list refresh failed: %s", err)
+            return
+        if not ok:
+            return
+        current = {coordinator.serial for coordinator in runtime.coordinators}
+        latest = set(api.get_hub_list())
+        if latest != current:
+            _LOGGER.info(
+                "ezloPi account hub set changed (have %s, now %s); reloading entry",
+                sorted(current),
+                sorted(latest),
+            )
+            hass.config_entries.async_schedule_reload(entry.entry_id)
+
+    entry.async_on_unload(
+        async_track_time_interval(
+            hass, _async_refresh_hub_list, _HUBLIST_REFRESH_INTERVAL
+        )
+    )
     return True
 
 
